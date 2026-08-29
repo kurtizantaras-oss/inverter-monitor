@@ -7,13 +7,14 @@
 #include <ArduinoOTA.h>
 #include <Update.h>
 #include <cmath>
+#include <time.h>
 
 #define RX2_PIN 16
 #define TX2_PIN 17
 #define RS485_CTRL 4
 #define SLAVE_ID 0x04
 #define LED_PIN 2
-#define SKETCH_VERSION "3.4.21"
+#define SKETCH_VERSION "3.6.1-UA"
 
 constexpr uint32_t MODBUS_UPDATE_INTERVAL_MS = 3000;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 12000;
@@ -46,6 +47,16 @@ struct PowerSnapshot {
   bool valid=false; int workState=0; float vGrid=0;
   int gridPowerRaw=0, loadW=0, solarW=0;
 };
+
+struct EnergyTracker {
+  float totalProdAtDayStart=0;
+  float totalProdAtMonthStart=0;
+  float totalGridAtDayStart=0;
+  float totalGridAtMonthStart=0;
+  int lastDay=-1;
+  int lastMonth=-1;
+};
+EnergyTracker energy;
 
 AsyncWebServer server(80);
 DNSServer dnsServer;
@@ -104,7 +115,17 @@ const char* workShort(int ws){
   switch(ws){case 0:return "ON";case 1:return "TEST";case 2:return "BATT";
   case 3:return "TIE";case 4:return "BYPASS";case 5:return "STOP";case 6:return "CHRG";default:return "--";}
 }
-String mpptStr(uint16_t r){if(r==0xFFFF)return "--";return (r==1)?"Run":(r==0?"Stop":String(r));}
+String mpptStr(uint16_t r){
+  if(r==0xFFFF)return "--";
+  switch(r){
+    case 0:return "Stop";
+    case 1:return "Run";
+    case 2:return "Standby";
+    case 3:return "Error";
+    case 4:return "Init";
+    default:return "State "+String(r);
+  }
+}
 String chgStateStr(uint16_t r){if(r==0xFFFF)return "--";return (r==1)?"Charging":(r==0?"Idle":(r==2?"Float":String(r)));}
 
 String decodeErrors(uint16_t e1,uint16_t e2,uint16_t e3){
@@ -299,6 +320,55 @@ void updateBatteryMetrics(){
   inv.pNet=inv.systemBalanceShow;
 }
 
+void loadEnergy(){
+  preferences.begin("energy",true);
+  energy.totalProdAtDayStart=preferences.getFloat("prodDayStart",0);
+  energy.totalProdAtMonthStart=preferences.getFloat("prodMonthStart",0);
+  energy.totalGridAtDayStart=preferences.getFloat("gridDayStart",0);
+  energy.totalGridAtMonthStart=preferences.getFloat("gridMonthStart",0);
+  energy.lastDay=preferences.getInt("day",-1);
+  energy.lastMonth=preferences.getInt("month",-1);
+  preferences.end();
+}
+
+void saveEnergy(){
+  preferences.begin("energy",false);
+  preferences.putFloat("prodDayStart",energy.totalProdAtDayStart);
+  preferences.putFloat("prodMonthStart",energy.totalProdAtMonthStart);
+  preferences.putFloat("gridDayStart",energy.totalGridAtDayStart);
+  preferences.putFloat("gridMonthStart",energy.totalGridAtMonthStart);
+  preferences.putInt("day",energy.lastDay);
+  preferences.putInt("month",energy.lastMonth);
+  preferences.end();
+}
+
+void checkTimeRollover(){
+  struct tm t;
+  if(!getLocalTime(&t))return;
+  int currentDay=t.tm_mday;
+  int currentMonth=t.tm_mon+1;
+  auto getTotalGrid=[&]()->float{
+    if(inv.inv[48]==0xFFFF||inv.inv[49]==0xFFFF)return 0.0f;
+    return (float)inv.inv[48]*1000.0f+(float)inv.inv[49]/10.0f;
+  };
+  if(energy.lastDay!=currentDay){
+    energy.totalProdAtDayStart=inv.pvEnergy;
+    energy.totalGridAtDayStart=getTotalGrid();
+    energy.lastDay=currentDay;
+    Serial.printf("Новий день: prod=%.2f grid=%.2f kWh\n",
+      energy.totalProdAtDayStart,energy.totalGridAtDayStart);
+    saveEnergy();
+  }
+  if(energy.lastMonth!=currentMonth){
+    energy.totalProdAtMonthStart=inv.pvEnergy;
+    energy.totalGridAtMonthStart=getTotalGrid();
+    energy.lastMonth=currentMonth;
+    Serial.printf("Новий місяць: prod=%.2f grid=%.2f kWh\n",
+      energy.totalProdAtMonthStart,energy.totalGridAtMonthStart);
+    saveEnergy();
+  }
+}
+
 void pollModbusOnce(){
   bool ok=true;
   if(!readModbusBlock(25201,80,invBuf))ok=false;delay(40);
@@ -348,7 +418,14 @@ void modbusTask(void*pvParameters){
       pendingCounterReset=false;
       bool ok1=(node.writeSingleRegister(20213,1)==node.ku8MBSuccess);delay(100);
       bool ok2=(node.writeSingleRegister(10112,1)==node.ku8MBSuccess);
-      Serial.printf("Counter reset: inverter=%d charger=%d\n",ok1?1:0,ok2?1:0);delay(100);
+      Serial.printf("Скидання лічильників: інвертор=%d зарядний=%d\n",ok1?1:0,ok2?1:0);
+      energy.totalProdAtDayStart=0;
+      energy.totalProdAtMonthStart=0;
+      energy.totalGridAtDayStart=0;
+      energy.totalGridAtMonthStart=0;
+      saveEnergy();
+      Serial.println("Локальні лічильники енергії скинуто та збережено.");
+      delay(100);
     }
     if(!webUpdateActive&&(millis()-lastUpdateMs>=MODBUS_UPDATE_INTERVAL_MS)){
       lastUpdateMs=millis();pollModbusOnce();
@@ -359,7 +436,7 @@ void modbusTask(void*pvParameters){
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Inverter Dashboard</title>
+<title>Панель інвертора</title>
 <style>
 body{background:#0f0f0f;color:#e6e6e6;font-family:'Consolas','Menlo',monospace;padding:14px;margin:0}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
@@ -367,8 +444,6 @@ body{background:#0f0f0f;color:#e6e6e6;font-family:'Consolas','Menlo',monospace;p
 .label{color:#888;font-size:13px}
 .value{font-size:14px;margin-top:8px;font-weight:bold;white-space:pre-line;line-height:1.6;text-align:center}
 .green{color:#00ff88}.red{color:#ff4d4d}.blue{color:#4da3ff}.yellow{color:#ffd166}
-.balance.pos{color:#00ff88}.balance.neg{color:#ff4d4d}.balance.zero{color:#4da3ff}
-.rec-tile{font-size:12px;line-height:1.5;text-align:left;white-space:pre-line;margin-top:6px}
 .upd{display:flex;flex-direction:column;gap:6px;align-items:center;margin-top:8px;width:100%}
 .upd input[type=file]{color:#888;font-size:11px;max-width:100%}
 .btn-upd{background:#00ff88;color:#000;border:none;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:bold;width:100%}
@@ -376,53 +451,140 @@ body{background:#0f0f0f;color:#e6e6e6;font-family:'Consolas','Menlo',monospace;p
 .prog{height:8px;background:#333;border-radius:4px;margin-top:8px;overflow:hidden;display:none;width:100%}
 .prog div{height:100%;width:0%;background:#00ff88}
 .updstatus{margin-top:8px;font-size:11px;color:#888}
-.cols{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.flow{margin-bottom:12px}
+.flow svg{width:100%;height:auto;display:block}
+.mode-box{background:#1c1c1c;border-radius:10px;padding:14px;text-align:center;margin-bottom:12px}
+.mode-name{color:#00ff88;font-size:20px;font-weight:bold;margin-top:6px}
+.mode-prio{color:#888;font-size:12px;margin-top:6px}
+.mode-state{color:#4da3ff;font-size:12px;margin-top:4px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
 .panel{background:#1c1c1c;border-radius:10px;padding:12px;font-size:12px}
 .panel h4{margin:0 0 10px 0;color:#aaa;font-size:12px;font-weight:normal;letter-spacing:1px}
 .row{display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid #242424}
 .row:last-child{border-bottom:none}
 .row .k{color:#888;white-space:nowrap}
 .row .v{color:#e6e6e6;font-weight:bold;text-align:right}
-@media(max-width:900px){.cols{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr 1fr}}
+.cols{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.rec-tile{font-size:12px;line-height:1.5;text-align:left;white-space:pre-line;margin-top:6px}
+details.diag{margin-top:12px}
+details.diag summary{cursor:pointer;color:#888;font-size:12px;padding:10px;background:#1c1c1c;border-radius:10px;text-align:center}
+@media(max-width:900px){.cols{grid-template-columns:1fr}.grid{grid-template-columns:1fr 1fr}.stats{grid-template-columns:1fr}}
 </style></head><body>
+
+<div class="flow">
+<svg viewBox="0 0 960 370" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arrG" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 z" fill="#00ff88"/></marker>
+<marker id="arrR" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 z" fill="#ff4d4d"/></marker>
+<marker id="arrB" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 z" fill="#4da3ff"/></marker>
+</defs>
+<path id="ln_solar" d="M290 95 H350 V150 H392" fill="none" stroke="#00ff88" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrG)"/>
+<path id="ln_grid" d="M290 295 H350 V230 H392" fill="none" stroke="#00ff88" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrG)"/>
+<path id="ln_load" d="M568 150 H610 V85 H662" fill="none" stroke="#00ff88" stroke-width="2" marker-end="url(#arrG)"/>
+<path id="ln_bat" d="M568 230 H610 V285 H662" fill="none" stroke="#00ff88" stroke-width="2"/>
+<path d="M480 274 V352" fill="none" stroke="#4da3ff" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrB)"/>
+
+<g><rect x="20" y="20" width="270" height="150" rx="10" fill="#1c1c1c" stroke="#242424"/>
+<g stroke="#ffd166" stroke-width="2"><circle cx="60" cy="62" r="11" fill="#ffd166" stroke="none"/>
+<line x1="60" y1="42" x2="60" y2="47"/><line x1="60" y1="77" x2="60" y2="82"/><line x1="40" y1="62" x2="45" y2="62"/><line x1="75" y1="62" x2="80" y2="62"/>
+<line x1="46" y1="48" x2="50" y2="52"/><line x1="70" y1="72" x2="74" y2="76"/><line x1="46" y1="76" x2="50" y2="72"/><line x1="70" y1="52" x2="74" y2="48"/></g>
+<text x="95" y="48" fill="#888" font-size="13" font-family="Arial">Сонячні панелі</text>
+<text x="95" y="80" fill="#ffd166" font-size="24" font-weight="bold" font-family="Arial" id="f_solar_p">-- кВт</text>
+<text x="95" y="106" fill="#888" font-size="12" id="f_solar_s">PV: -- V / -- A</text>
+<text x="95" y="128" fill="#888" font-size="12" id="f_solar_mppt">MPPT: --</text></g>
+
+<g><rect x="20" y="230" width="270" height="155" rx="10" fill="#1c1c1c" stroke="#242424"/>
+<g stroke="#4da3ff" stroke-width="2" fill="none"><path d="M52 255 L60 290 M68 255 L60 290 M54 263 H66 M52 272 H68 M50 281 H70"/></g>
+<text x="95" y="260" fill="#888" font-size="13" font-family="Arial">Мережа</text>
+<text x="95" y="298" fill="#fff" font-size="24" font-weight="bold" font-family="Arial" id="f_grid_p">-- кВт</text>
+<text x="95" y="322" fill="#888" font-size="12" id="f_grid_s">-- V / -- A</text>
+<text x="95" y="345" fill="#888" font-size="12" id="f_grid_hz">-- Hz</text></g>
+
+<g><rect x="670" y="20" width="270" height="130" rx="10" fill="#1c1c1c" stroke="#242424"/>
+<g stroke="#00ff88" stroke-width="2" fill="none"><path d="M48 62 L60 50 L72 62"/><path d="M52 60 V74 H68 V60"/></g>
+<text x="745" y="50" fill="#888" font-size="13" font-family="Arial">Навантаження</text>
+<text x="745" y="88" fill="#fff" font-size="24" font-weight="bold" font-family="Arial" id="f_load_p">-- кВт</text>
+<text x="745" y="112" fill="#888" font-size="12" id="f_load_s">-- V / -- A</text></g>
+
+<g><rect x="670" y="210" width="270" height="150" rx="10" fill="#1c1c1c" stroke="#242424"/>
+<g stroke="#00ff88" stroke-width="2" fill="none"><rect x="48" y="242" width="26" height="20" rx="3"/>
+<line x1="56" y1="238" x2="56" y2="242"/><line x1="66" y1="238" x2="66" y2="242"/>
+<rect x="52" y="246" width="5" height="12" fill="#00ff88" stroke="none"/><rect x="59" y="246" width="5" height="12" fill="#00ff88" stroke="none"/></g>
+<text x="745" y="240" fill="#888" font-size="13" font-family="Arial">Акумулятор</text>
+<text x="745" y="270" fill="#e6e6e6" font-size="22" font-weight="bold" font-family="Arial" id="f_bat_p">-- кВт</text>
+<text x="745" y="292" fill="#888" font-size="12" id="f_bat_i">Струм: --</text>
+<text x="745" y="310" fill="#888" font-size="12" id="f_bat_v">Напруга: --</text>
+<text x="745" y="328" fill="#888" font-size="12" id="f_bat_load">ACCUM load: --</text>
+<text x="745" y="346" fill="#888" font-size="12" id="f_bat_self">Self use: --</text></g>
+
+<g><rect x="400" y="110" width="160" height="215" rx="10" fill="#e4e4e7" stroke="#52525b" stroke-width="2"/>
+<rect x="430" y="132" width="100" height="62" rx="4" fill="#1c1917"/>
+<text x="480" y="158" fill="#00ff88" font-size="14" text-anchor="middle" font-family="monospace" font-weight="bold" id="f_inv_p">--W</text>
+<text x="480" y="178" fill="#888" font-size="10" text-anchor="middle" font-family="monospace" id="f_inv_mode">--</text>
+<text x="480" y="216" font-size="12" text-anchor="middle" font-family="monospace" font-weight="bold"><tspan fill="#888">Inv. load: </tspan><tspan id="f_inv_load_pct" fill="#52525b">--%</tspan></text>
+<circle cx="480" cy="232" r="5" fill="#00ff88" id="f_led"/>
+<text x="480" y="252" fill="#52525b" font-size="9" text-anchor="middle" font-family="Arial" letter-spacing="1">MUST PV1800</text>
+<text x="480" y="275" fill="#00ff88" font-size="18" text-anchor="middle" font-family="monospace" font-weight="bold" id="f_inv_err">--</text>
+<text x="480" y="300" fill="#ffd166" font-size="18" text-anchor="middle" font-family="monospace" font-weight="bold" id="f_inv_warn">--</text>
+</g>
+</svg>
+</div>
+
+<div class="mode-box">
+  <div class="label">Режим роботи</div>
+  <div class="mode-name" id="f_mode">--</div>
+  <div class="mode-prio" id="f_prio">Пріоритет: --</div>
+  <div class="mode-state" id="f_state">--</div>
+</div>
+
+<div class="stats">
+  <div class="panel"><h4>⚡ Виробництво енергії</h4>
+    <div class="row"><span class="k">Сьогодні</span><span class="v green" id="st_p_today">--</span></div>
+    <div class="row"><span class="k">Місяць</span><span class="v green" id="st_p_month">--</span></div>
+    <div class="row"><span class="k">Всього</span><span class="v green" id="st_p_total">--</span></div>
+  </div>
+  <div class="panel"><h4>🔌 Імпорт з мережі</h4>
+    <div class="row"><span class="k">Сьогодні</span><span class="v blue" id="st_g_today">--</span></div>
+    <div class="row"><span class="k">Місяць</span><span class="v blue" id="st_g_month">--</span></div>
+    <div class="row"><span class="k">Всього</span><span class="v blue" id="st_g_total">--</span></div>
+  </div>
+  <div class="panel"><h4>🔋 Акумулятор</h4>
+    <div class="row"><span class="k">Статус</span><span class="v" id="st_b_status">--</span></div>
+    <div class="row"><span class="k">Напруга</span><span class="v" id="st_b_volt">--</span></div>
+    <div class="row"><span class="k">Струм</span><span class="v" id="st_b_curr">--</span></div>
+  </div>
+</div>
+
 <div class="grid">
-  <div class="box"><div class="label">SOLAR</div><div class="value green" id="solar">0V
-0W</div></div>
-  <div class="box"><div class="label">GRID</div><div class="value blue" id="grid">0V
-0W</div></div>
-  <div class="box"><div class="label">SYSTEM BALANCE</div><div class="value balance zero" id="balance">---
-0W | 0%</div></div>
-  <div class="box"><div class="label">LOAD</div><div class="value red" id="load">0V
-0W</div></div>
-  <div class="box"><div class="label">BAT</div><div class="value yellow" id="bat">0V
-0W</div></div>
-  <div class="box"><div class="label">ENERGY STATS</div><div class="value green" id="pvEnergy">PV ENERGY - 0 kWh
-ACCUM load - 0 kWh
-ACCUM DISCHARGE - 0 kWh</div></div>
-  <div class="box"><div class="label">INV LOSS / AC TEMP</div><div class="value yellow" id="lossTemp">INV LOSS - 0 W
-AC RAD TEMP - 0C</div></div>
-  <div class="box"><div class="label">SYSTEM SETTINGS</div><div class="value" id="settings">Offgrid work enable - ---
-Current mode - ---
-Charger priority - ---</div></div>
-  <div class="box"><div class="label">RECOMMENDATIONS</div><div class="value rec-tile" id="recs">--</div></div>
+  <div class="box"><div class="label">ОНОВЛЕННЯ ПРОШИВКИ</div>
+    <div class="upd">
+      <input type="file" id="fwfile" accept=".bin">
+      <button class="btn-upd" onclick="doUpdate()">Оновити</button>
+    </div>
+    <div class="prog" id="progbox"><div id="prog"></div></div>
+    <div class="updstatus" id="updStatus">Оберіть файл .bin</div>
+  </div>
+  <div class="box"><div class="label">СКИДАННЯ ЛІЧИЛЬНИКІВ</div>
+    <div class="upd">
+      <button class="btn-upd btn-warn" onclick="resetCounters()">Скинути лічильники</button>
+    </div>
+    <div class="updstatus" id="cntStatus">Обнулення ACCUM та PV ENERGY (незворотно!)</div>
+  </div>
+  <div class="box"><div class="label">СКИДАННЯ WI-FI</div>
+    <div class="upd">
+      <button class="btn-upd btn-gray" onclick="resetWifi()">Скинути Wi-Fi</button>
+    </div>
+    <div class="updstatus">Налаштування мережі буде видалено</div>
+  </div>
+</div>
+
+<details class="diag">
+<summary>🔧 Детальна діагностика</summary>
+<div class="grid" style="margin-top:12px">
+  <div class="box" style="grid-column:1/-1"><div class="label">РЕКОМЕНДАЦІЇ</div><div class="value rec-tile" id="recs">--</div></div>
 </div>
 <div class="cols">
-  <div class="panel"><h4>BATTERY SETTINGS</h4>
-    <div class="row"><span class="k">Battery type</span><span class="v" id="bs_type">--</span></div>
-    <div class="row"><span class="k">Battery AH</span><span class="v" id="bs_ah">--</span></div>
-    <div class="row"><span class="k">Battery low V</span><span class="v" id="bs_lowv">--</span></div>
-    <div class="row"><span class="k">Battery high V</span><span class="v" id="bs_highv">--</span></div>
-    <div class="row"><span class="k">Battery low return V</span><span class="v" id="bs_lowret">--</span></div>
-    <div class="row"><span class="k">Max charger I</span><span class="v" id="bs_maxchg">--</span></div>
-    <div class="row"><span class="k">Max discharger I</span><span class="v" id="bs_maxdis">--</span></div>
-    <div class="row"><span class="k">Grid max input I</span><span class="v" id="bs_gridin">--</span></div>
-    <div class="row"><span class="k">Grid max output I</span><span class="v" id="bs_gridout">--</span></div>
-    <div class="row"><span class="k">Absorb charger I</span><span class="v" id="bs_absorb">--</span></div>
-    <div class="row"><span class="k">Max combine I</span><span class="v" id="bs_combine">--</span></div>
-    <div class="row"><span class="k">Charger time</span><span class="v" id="bs_chgtime">--</span></div>
-    <div class="row"><span class="k">Discharger time</span><span class="v" id="bs_distime">--</span></div>
-  </div>
-  <div class="panel"><h4>CHARGER MESSAGE (LIVE)</h4>
+  <div class="panel"><h4>ПОВІДОМЛЕННЯ ЗАРЯДНОГО (LIVE)</h4>
     <div class="row"><span class="k">Work state</span><span class="v" id="ch_work">--</span></div>
     <div class="row"><span class="k">Mppt state</span><span class="v" id="ch_mppt">--</span></div>
     <div class="row"><span class="k">Charging state</span><span class="v" id="ch_state">--</span></div>
@@ -431,7 +593,6 @@ Charger priority - ---</div></div>
     <div class="row"><span class="k">Current</span><span class="v" id="ch_cur">--</span></div>
     <div class="row"><span class="k">Power</span><span class="v" id="ch_pow">--</span></div>
     <div class="row"><span class="k">Radiator temp</span><span class="v" id="ch_rad">--</span></div>
-    <div class="row"><span class="k">External temp</span><span class="v" id="ch_ext">--</span></div>
     <div class="row"><span class="k">Battery Relay</span><span class="v" id="ch_brel">--</span></div>
     <div class="row"><span class="k">PV Relay</span><span class="v" id="ch_pvrel">--</span></div>
     <div class="row"><span class="k">BattVol Grade</span><span class="v" id="ch_grade">--</span></div>
@@ -440,7 +601,7 @@ Charger priority - ---</div></div>
     <div class="row"><span class="k">Error</span><span class="v red" id="ch_err">--</span></div>
     <div class="row"><span class="k">Warning</span><span class="v yellow" id="ch_warn">--</span></div>
   </div>
-  <div class="panel"><h4>INVERTER MESSAGE A</h4>
+  <div class="panel"><h4>ПОВІДОМЛЕННЯ ІНВЕРТОРА A</h4>
     <div class="row"><span class="k">Work state</span><span class="v" id="ia_work">--</span></div>
     <div class="row"><span class="k">AC voltage grade</span><span class="v" id="ia_acgrade">--</span></div>
     <div class="row"><span class="k">Rated power</span><span class="v" id="ia_rated">--</span></div>
@@ -460,16 +621,8 @@ Charger priority - ---</div></div>
     <div class="row"><span class="k">SGrid</span><span class="v" id="ia_sgrid">--</span></div>
     <div class="row"><span class="k">SLoad</span><span class="v" id="ia_sload">--</span></div>
   </div>
-  <div class="panel"><h4>INVERTER MESSAGE B</h4>
+  <div class="panel"><h4>ПОВІДОМЛЕННЯ ІНВЕРТОРА B</h4>
     <div class="row"><span class="k">AC radiator temp</span><span class="v" id="ib_tac">--</span></div>
-    <div class="row"><span class="k">Transformer temp</span><span class="v" id="ib_ttr">--</span></div>
-    <div class="row"><span class="k">DC radiator temp</span><span class="v" id="ib_tdc">--</span></div>
-    <div class="row"><span class="k">Inverter relay</span><span class="v" id="ib_rinv">--</span></div>
-    <div class="row"><span class="k">Grid relay</span><span class="v" id="ib_rgrid">--</span></div>
-    <div class="row"><span class="k">Load relay</span><span class="v" id="ib_rload">--</span></div>
-    <div class="row"><span class="k">N-Line relay</span><span class="v" id="ib_rnline">--</span></div>
-    <div class="row"><span class="k">DC relay</span><span class="v" id="ib_rdc">--</span></div>
-    <div class="row"><span class="k">Earth relay</span><span class="v" id="ib_rearth">--</span></div>
     <div class="row"><span class="k">QInverter</span><span class="v" id="ib_qinv">--</span></div>
     <div class="row"><span class="k">QGrid</span><span class="v" id="ib_qgrid">--</span></div>
     <div class="row"><span class="k">QLoad</span><span class="v" id="ib_qload">--</span></div>
@@ -485,41 +638,14 @@ Charger priority - ---</div></div>
     <div class="row"><span class="k">Batt current</span><span class="v" id="ib_bcur">--</span></div>
     <div class="row"><span class="k">Inverter Hz</span><span class="v" id="ib_ihz">--</span></div>
     <div class="row"><span class="k">Grid Hz</span><span class="v" id="ib_ghz">--</span></div>
-    <div class="row"><span class="k">Error</span><span class="v red" id="ib_err">--</span></div>
-    <div class="row"><span class="k">Warning</span><span class="v yellow" id="ib_warn">--</span></div>
   </div>
 </div>
-<div class="grid">
-  <div class="box"><div class="label">FIRMWARE UPDATE</div>
-    <div class="upd">
-      <input type="file" id="fwfile" accept=".bin">
-      <button class="btn-upd" onclick="doUpdate()">Оновити</button>
-    </div>
-    <div class="prog" id="progbox"><div id="prog"></div></div>
-    <div class="updstatus" id="updStatus">Оберіть файл .bin</div>
-  </div>
-  <div class="box"><div class="label">COUNTERS RESET</div>
-    <div class="upd">
-      <button class="btn-upd btn-warn" onclick="resetCounters()">Скинути лічильники</button>
-    </div>
-    <div class="updstatus" id="cntStatus">Обнулення ACCUM та PV ENERGY (незворотно!)</div>
-  </div>
-  <div class="box"><div class="label">WI-FI RESET</div>
-    <div class="upd">
-      <button class="btn-upd btn-gray" onclick="resetWifi()">Скинути Wi-Fi</button>
-    </div>
-    <div class="updstatus">Налаштування мережі буде видалено</div>
-  </div>
-</div>
+</details>
+
 <script>
-function s(id,v){document.getElementById(id).innerText=v;}
-function setBalance(w,m,l){
-  let e=document.getElementById("balance");
-  e.innerText=m+"\n"+w+"W | "+l+"%";
-  e.className="value balance "+(w>5?"pos":(w<-5?"neg":"zero"));
-}
+function s(id,v){let e=document.getElementById(id);if(e)e.textContent=v;}
 async function resetWifi(){
-  if(confirm("Скинути Wi-Fi?")){await fetch("/reset_wifi");alert("Перезавантаження в режим точки доступу...");location.reload();}
+  if(confirm("Скинути Wi-Fi?")){await fetch("/reset_wifi");alert("Перезавантаження в режимі точки доступу...");location.reload();}
 }
 async function resetCounters(){
   if(!confirm("Скинути всі накопичувальні лічильники інвертора?\nACCUM та PV ENERGY обнуляться.\nДія НЕЗВОРОТНА!"))return;
@@ -546,40 +672,113 @@ function doUpdate(){
   xhr.onerror=function(){s("updStatus","❌ Помилка з'єднання");};
   xhr.send(fd);
 }
+function kw(w){return (w/1000).toFixed(2)+" кВт";}
+function modeInfo(m){
+  switch(m){
+    case "SBU":return["Інтелектуальний","Сонячна енергія → Акумулятор → Мережа"];
+    case "SUB":return["Змішаний","Сонячна енергія → Мережа → Акумулятор"];
+    case "UTI":return["Мережевий","Мережа → Сонячна енергія → Акумулятор"];
+    case "SOL":return["Тільки сонце","Сонячна енергія → Акумулятор"];
+    default:return["Режим: "+m,"--"];
+  }
+}
+function updateFlow(d){
+  let pvV=parseFloat(d.ch_pvv),pvA=parseFloat(d.ch_cur),pvW=parseFloat(d.ch_pow);
+  s("f_solar_p",kw(isNaN(pvW)?d.solar:pvW));
+  s("f_solar_s","PV: "+(isNaN(pvV)?"--":pvV.toFixed(1))+" V / "+(isNaN(pvA)?"--":pvA.toFixed(1))+" A");
+  s("f_solar_mppt","MPPT: "+d.ch_mppt);
+  s("f_grid_p",kw(Math.abs(d.gridPowerShow)));
+  s("f_grid_s",d.grid.toFixed(0)+" V / "+(d.grid>80?(Math.abs(d.gridPowerShow)/d.grid).toFixed(1):"0.0")+" A");
+  s("f_grid_hz",d.ib_ghz);
+  s("f_load_p",kw(d.loadPower));
+  s("f_load_s",d.loadVolt.toFixed(0)+" V / "+(d.loadVolt>10?(d.loadPower/d.loadVolt).toFixed(1):"0.0")+" A");
+  let bp=parseFloat(d.ib_bpow);
+  let batLine=document.getElementById("ln_bat");
+  if(bp>5){
+    batLine.setAttribute("d","M568 230 H610 V285 H662");
+    batLine.setAttribute("marker-end","url(#arrB)");
+    batLine.setAttribute("marker-start","none");
+    batLine.setAttribute("stroke","#4da3ff");
+    batLine.style.opacity=1;
+  }else if(bp<-5){
+    batLine.setAttribute("d","M662 285 H610 V230 H568");
+    batLine.setAttribute("marker-end","url(#arrR)");
+    batLine.setAttribute("marker-start","none");
+    batLine.setAttribute("stroke","#ff4d4d");
+    batLine.style.opacity=1;
+  }else{
+    batLine.setAttribute("d","M568 230 H610 V285 H662");
+    batLine.setAttribute("marker-end","none");
+    batLine.setAttribute("marker-start","none");
+    batLine.setAttribute("stroke","#00ff88");
+    batLine.style.opacity=0.25;
+  }
+  s("f_bat_p",(isNaN(bp)?"0.00":(Math.abs(bp)/1000).toFixed(2))+" кВт");
+  let bpEl=document.getElementById("f_bat_p");
+  if(bpEl)bpEl.setAttribute("fill",d.batClass=="red"?"#ff4d4d":d.batClass=="green"?"#00ff88":"#e6e6e6");
+  s("f_bat_i","Струм: "+d.ib_bcur);
+  s("f_bat_v","Напруга: "+d.batteryVolt.toFixed(1)+" V");
+  s("f_bat_load","ACCUM load: "+d.ib_accload);
+  s("f_bat_self","Self use: "+d.ib_accself);
+  document.getElementById("ln_solar").style.opacity=(isNaN(pvW)?d.solar:pvW)>5?1:0.25;
+  document.getElementById("ln_grid").style.opacity=Math.abs(d.gridPowerShow)>10?1:0.25;
+  document.getElementById("ln_load").style.opacity=d.loadPower>5?1:0.25;
+  s("f_inv_p",d.loadPower+" W");
+  s("f_inv_mode",d.workMode);
+  let pctEl=document.getElementById("f_inv_load_pct");
+  if(pctEl){
+    pctEl.textContent=d.loadPercent+"%";
+    pctEl.setAttribute("fill",d.loadPercent>=90?"#ff4d4d":d.loadPercent>=70?"#b45309":"#52525b");
+  }
+  let led=document.getElementById("f_led");
+  if(led)led.setAttribute("fill",d.batClass=="red"?"#ff4d4d":d.batClass=="green"?"#00ff88":"#4da3ff");
+  let errEl=document.getElementById("f_inv_err");
+  let warnEl=document.getElementById("f_inv_warn");
+  if(errEl){
+    let errShort=d.ib_err.length>22?d.ib_err.substring(0,20)+"..":d.ib_err;
+    errEl.textContent=errShort;
+    errEl.setAttribute("fill",d.ib_err==="No errors"?"#00ff88":"#ff4d4d");
+  }
+  if(warnEl){
+    let warnShort=d.ib_warn.length>22?d.ib_warn.substring(0,20)+"..":d.ib_warn;
+    warnEl.textContent=warnShort;
+    warnEl.setAttribute("fill",d.ib_warn==="No warnings"?"#00ff88":"#ffd166");
+  }
+  let mi=modeInfo(d.energyMode);
+  s("f_mode",mi[0]);
+  s("f_prio","Пріоритет: "+mi[1]);
+  s("f_state","Стан: "+d.state+" • Заряд: "+d.chargerPriority+" • Offgrid: "+d.offgridEnable+" • FW "+d.sketchVersion);
+  s("st_p_today",d.todayProd.toFixed(2)+" кВт·ч");
+  s("st_p_month",d.monthProd.toFixed(2)+" кВт·ч");
+  s("st_p_total",d.pvEnergy.toFixed(2)+" кВт·ч");
+  s("st_g_today",d.todayGrid.toFixed(2)+" кВт·ч");
+  s("st_g_month",d.monthGrid.toFixed(2)+" кВт·ч");
+  s("st_g_total",d.totalGrid.toFixed(2)+" кВт·ч");
+  let st=document.getElementById("st_b_status");
+  if(st){st.textContent=d.batMode=="CHARGE"?"Заряд":d.batMode=="DISCHARGE"?"Розряд":"Очікування";
+    st.className="v "+(d.batMode=="CHARGE"?"green":d.batMode=="DISCHARGE"?"red":"blue");}
+  s("st_b_volt",d.batteryVolt.toFixed(1)+" V");
+  s("st_b_curr",d.battAmp.toFixed(1)+" A");
+}
 async function update(){
   try{
     let r=await fetch("/api");let d=await r.json();
-    s("solar",d.pvvolt+"V\n"+d.solar+"W");
-    s("grid",d.grid+"V\n"+d.gridPowerShow+"W");
-    s("load",d.loadVolt+"V\n"+d.loadPower+"W");
-    s("lossTemp","INV LOSS - "+d.invLoss+" W\nAC RAD TEMP - "+d.tempAC+"C");
-    s("pvEnergy","PV ENERGY - "+d.pvEnergy+" kWh\nACCUM load - "+d.accumLoad+"\nACCUM DISCHARGE - "+d.accumDischarge);
-    let b=document.getElementById("bat");b.className="value "+d.batClass;
-    b.innerText=d.batMode+"\n"+d.batteryVolt+" V / "+d.battAmp+" A"+d.batSuffix+"\n"+d.batPowerDisplay+" W";
-    setBalance(d.net,d.workMode||d.state,d.loadPercent);
-    s("settings","Offgrid work enable - "+d.offgridEnable+"\nCurrent mode - "+d.energyMode+"\nCharger priority - "+d.chargerPriority);
+    updateFlow(d);
     s("recs",d.recs);
-    s("bs_type",d.bs_type);s("bs_ah",d.bs_ah);s("bs_lowv",d.bs_lowv);s("bs_highv",d.bs_highv);
-    s("bs_lowret",d.bs_lowret);s("bs_maxchg",d.bs_maxchg);s("bs_maxdis",d.bs_maxdis);
-    s("bs_gridin",d.bs_gridin);s("bs_gridout",d.bs_gridout);s("bs_absorb",d.bs_absorb);
-    s("bs_combine",d.bs_combine);s("bs_chgtime",d.bs_chgtime);s("bs_distime",d.bs_distime);
     s("ch_work",d.ch_work);s("ch_mppt",d.ch_mppt);s("ch_state",d.ch_state);s("ch_pvv",d.ch_pvv);
     s("ch_battv",d.ch_battv);s("ch_cur",d.ch_cur);s("ch_pow",d.ch_pow);s("ch_rad",d.ch_rad);
-    s("ch_ext",d.ch_ext);s("ch_brel",d.ch_brel);s("ch_pvrel",d.ch_pvrel);s("ch_grade",d.ch_grade);
+    s("ch_brel",d.ch_brel);s("ch_pvrel",d.ch_pvrel);s("ch_grade",d.ch_grade);
     s("ch_rcur",d.ch_rcur);s("ch_acc",d.ch_acc);s("ch_err",d.ch_err);s("ch_warn",d.ch_warn);
     s("ia_work",d.ia_work);s("ia_acgrade",d.ia_acgrade);s("ia_rated",d.ia_rated);s("ia_battv",d.ia_battv);
     s("ia_invv",d.ia_invv);s("ia_gridv",d.ia_gridv);s("ia_busv",d.ia_busv);s("ia_ictrl",d.ia_ictrl);
     s("ia_iinv",d.ia_iinv);s("ia_igrid",d.ia_igrid);s("ia_iload",d.ia_iload);s("ia_pinv",d.ia_pinv);
     s("ia_pgrid",d.ia_pgrid);s("ia_pload",d.ia_pload);s("ia_lpct",d.ia_lpct);s("ia_sinv",d.ia_sinv);
     s("ia_sgrid",d.ia_sgrid);s("ia_sload",d.ia_sload);
-    s("ib_tac",d.ib_tac);s("ib_ttr",d.ib_ttr);s("ib_tdc",d.ib_tdc);s("ib_rinv",d.ib_rinv);
-    s("ib_rgrid",d.ib_rgrid);s("ib_rload",d.ib_rload);s("ib_rnline",d.ib_rnline);
-    s("ib_rdc",d.ib_rdc);s("ib_rearth",d.ib_rearth);s("ib_qinv",d.ib_qinv);s("ib_qgrid",d.ib_qgrid);
+    s("ib_tac",d.ib_tac);s("ib_qinv",d.ib_qinv);s("ib_qgrid",d.ib_qgrid);
     s("ib_qload",d.ib_qload);s("ib_accchg",d.ib_accchg);s("ib_accdis",d.ib_accdis);
     s("ib_accbuy",d.ib_accbuy);s("ib_accsell",d.ib_accsell);s("ib_accload",d.ib_accload);
     s("ib_accself",d.ib_accself);s("ib_accpvsell",d.ib_accpvsell);s("ib_accgridchg",d.ib_accgridchg);
     s("ib_bpow",d.ib_bpow);s("ib_bcur",d.ib_bcur);s("ib_ihz",d.ib_ihz);s("ib_ghz",d.ib_ghz);
-    s("ib_err",d.ib_err);s("ib_warn",d.ib_warn);
   }catch(e){}
 }
 setInterval(update,3000);update();
@@ -645,12 +844,12 @@ void startSetupAP(){
 
 void onUpdateUpload(AsyncWebServerRequest*request,String filename,size_t index,uint8_t*data,size_t len,bool final){
   if(index==0){
-    webUpdateActive=true;Serial.printf("Update Start: %s\n",filename.c_str());
+    webUpdateActive=true;Serial.printf("Початок оновлення: %s\n",filename.c_str());
     if(!Update.begin((ESP.getFreeSketchSpace()-0x1000)&0xFFFFF000))Update.printError(Serial);
   }
   if(!Update.hasError()){if(Update.write(data,len)!=len)Update.printError(Serial);}
   if(final){
-    if(Update.end(true))Serial.printf("Update Success: %u bytes\n",(unsigned)(index+len));
+    if(Update.end(true))Serial.printf("Оновлення успішне: %u байт\n",(unsigned)(index+len));
     else{Update.printError(Serial);webUpdateActive=false;}
   }
 }
@@ -677,21 +876,6 @@ void setupWebServer(){
     if(strcmp(inv.batModeUi,"CHARGE")==0)battAmpShown=inv.battAmpDisplay;
     else if(strcmp(inv.batModeUi,"DISCHARGE")==0)battAmpShown=-inv.battAmpDisplay;
     String recs=buildRecommendations();recs.replace("\n","\\n");
-    String bs_type=battTypeStr(inv.ctrl[28]);
-    String bs_ah=fUnit(inv.ctrl[29],1,0,"AH");
-    String bs_lowv=fUnit(inv.ctrl[26],10,1,"V");
-    String bs_highv=fUnit(inv.ctrl[27],10,1,"V");
-    String bs_lowret=fUnit(inv.ctrl[30],10,1,"V");
-    String bs_maxchg=fUnit(inv.ctrl[13],10,1,"A");
-    String bs_maxdis=fUnit(inv.ctrl[12],10,1,"A");
-    String bs_gridin=fUnit(inv.ctrl[15],10,1,"A");
-    String bs_gridout=fUnit(inv.ctrl[14],10,1,"A");
-    String bs_absorb=fUnit(inv.ctrl[25],10,1,"A");
-    String bs_combine=fUnit(inv.ctrl[31],10,1,"A");
-    String bs_chgtime="--";
-    if(inv.ctrl[9]==1&&inv.ctrl[36]!=0xFFFF){char buf[32];snprintf(buf,sizeof(buf),"%02d:%02d - %02d:%02d",(int)inv.ctrl[36],(int)inv.ctrl[37],(int)inv.ctrl[38],(int)inv.ctrl[39]);bs_chgtime=String(buf);}
-    String bs_distime="--";
-    if(inv.ctrl[40]!=0xFFFF){char buf[32];snprintf(buf,sizeof(buf),"%02d:%02d - %02d:%02d",(int)inv.ctrl[40],(int)inv.ctrl[41],(int)inv.ctrl[42],(int)inv.ctrl[43]);bs_distime=String(buf);}
     String ch_work=(inv.pv[0]==0xFFFF)?"--":workShort(inv.pv[0]);
     String ch_mppt=mpptStr(inv.pv[1]);
     String ch_state=chgStateStr(inv.pv[2]);
@@ -700,7 +884,6 @@ void setupWebServer(){
     String ch_cur=(inv.pv[6]==0xFFFF)?"--":String((int16_t)inv.pv[6]/10.0f,1)+" A";
     String ch_pow=fUnit(inv.pv[7],1,0,"W");
     String ch_rad=fUnit(inv.pv[8],1,0,"C");
-    String ch_ext=fUnit(inv.pv[9],1,0,"C");
     String ch_brel=fRelay(inv.pv[12]);
     String ch_pvrel=fRelay(inv.pv[13]);
     String ch_grade=(inv.pv[14]==0xFFFF)?"--":String(inv.pv[14])+" V";
@@ -727,14 +910,6 @@ void setupWebServer(){
     String ia_sgrid=fUnit(inv.inv[17],1,0,"VA");
     String ia_sload=fUnit(inv.inv[18],1,0,"VA");
     String ib_tac=fUnit(inv.inv[32],1,0,"C");
-    String ib_ttr=fUnit(inv.inv[33],1,0,"C");
-    String ib_tdc=fUnit(inv.inv[34],1,0,"C");
-    String ib_rinv=fRelay(inv.inv[36]);
-    String ib_rgrid=fRelay(inv.inv[37]);
-    String ib_rload=fRelay(inv.inv[38]);
-    String ib_rnline=fRelay(inv.inv[39]);
-    String ib_rdc=fRelay(inv.inv[40]);
-    String ib_rearth=fRelay(inv.inv[41]);
     String ib_qinv=fUnit(inv.inv[20],1,0,"var");
     String ib_qgrid=fUnit(inv.inv[21],1,0,"var");
     String ib_qload=fUnit(inv.inv[22],1,0,"var");
@@ -752,6 +927,19 @@ void setupWebServer(){
     String ib_ghz=fUnit(inv.inv[25],100,2,"Hz");
     String ib_err=decodeErrors(inv.err1,inv.err2,inv.err3);
     String ib_warn=decodeWarnings(inv.warn1,inv.warn2);
+    float totalGridKwh=((inv.inv[48]==0xFFFF)||(inv.inv[49]==0xFFFF))?0.0f:((float)inv.inv[48]*1000.0f+(float)inv.inv[49]/10.0f);
+
+    // Виробництво — різниця від лічильника інвертора
+    float todayProd=inv.pvEnergy-energy.totalProdAtDayStart;
+    float monthProd=inv.pvEnergy-energy.totalProdAtMonthStart;
+    if(todayProd<0)todayProd=0;
+    if(monthProd<0)monthProd=0;
+
+    // Імпорт з мережі — різниця від лічильника інвертора
+    float todayGrid=totalGridKwh-energy.totalGridAtDayStart;
+    float monthGrid=totalGridKwh-energy.totalGridAtMonthStart;
+    if(todayGrid<0)todayGrid=0;
+    if(monthGrid<0)monthGrid=0;
 
     AsyncResponseStream*res=req->beginResponseStream("application/json");
     res->printf("{\"state\":\"%s\",",inv.stateStr);
@@ -776,6 +964,11 @@ void setupWebServer(){
     res->printf("\"accumDischarge\":\"%s\",",ib_accdis.c_str());
     res->printf("\"net\":%.0f,",inv.pNet);
     res->printf("\"sketchVersion\":\"" SKETCH_VERSION "\",");
+    res->printf("\"todayProd\":%.2f,",todayProd);
+    res->printf("\"monthProd\":%.2f,",monthProd);
+    res->printf("\"todayGrid\":%.2f,",todayGrid);
+    res->printf("\"monthGrid\":%.2f,",monthGrid);
+    res->printf("\"totalGrid\":%.1f,",totalGridKwh);
     res->printf("\"offgridEnable\":\"%s\",",inv.offgridEnable==1?"ON":"OFF");
     switch(inv.energyMode){
       case 1:res->print("\"energyMode\":\"SBU\",");break;
@@ -791,19 +984,6 @@ void setupWebServer(){
       default:res->printf("\"chargerPriority\":\"PRIO%d\",",inv.chargerPriority);break;
     }
     res->printf("\"recs\":\"%s\",",recs.c_str());
-    res->printf("\"bs_type\":\"%s\",",bs_type.c_str());
-    res->printf("\"bs_ah\":\"%s\",",bs_ah.c_str());
-    res->printf("\"bs_lowv\":\"%s\",",bs_lowv.c_str());
-    res->printf("\"bs_highv\":\"%s\",",bs_highv.c_str());
-    res->printf("\"bs_lowret\":\"%s\",",bs_lowret.c_str());
-    res->printf("\"bs_maxchg\":\"%s\",",bs_maxchg.c_str());
-    res->printf("\"bs_maxdis\":\"%s\",",bs_maxdis.c_str());
-    res->printf("\"bs_gridin\":\"%s\",",bs_gridin.c_str());
-    res->printf("\"bs_gridout\":\"%s\",",bs_gridout.c_str());
-    res->printf("\"bs_absorb\":\"%s\",",bs_absorb.c_str());
-    res->printf("\"bs_combine\":\"%s\",",bs_combine.c_str());
-    res->printf("\"bs_chgtime\":\"%s\",",bs_chgtime.c_str());
-    res->printf("\"bs_distime\":\"%s\",",bs_distime.c_str());
     res->printf("\"ch_work\":\"%s\",",ch_work.c_str());
     res->printf("\"ch_mppt\":\"%s\",",ch_mppt.c_str());
     res->printf("\"ch_state\":\"%s\",",ch_state.c_str());
@@ -812,7 +992,6 @@ void setupWebServer(){
     res->printf("\"ch_cur\":\"%s\",",ch_cur.c_str());
     res->printf("\"ch_pow\":\"%s\",",ch_pow.c_str());
     res->printf("\"ch_rad\":\"%s\",",ch_rad.c_str());
-    res->printf("\"ch_ext\":\"%s\",",ch_ext.c_str());
     res->printf("\"ch_brel\":\"%s\",",ch_brel.c_str());
     res->printf("\"ch_pvrel\":\"%s\",",ch_pvrel.c_str());
     res->printf("\"ch_grade\":\"%s\",",ch_grade.c_str());
@@ -839,14 +1018,6 @@ void setupWebServer(){
     res->printf("\"ia_sgrid\":\"%s\",",ia_sgrid.c_str());
     res->printf("\"ia_sload\":\"%s\",",ia_sload.c_str());
     res->printf("\"ib_tac\":\"%s\",",ib_tac.c_str());
-    res->printf("\"ib_ttr\":\"%s\",",ib_ttr.c_str());
-    res->printf("\"ib_tdc\":\"%s\",",ib_tdc.c_str());
-    res->printf("\"ib_rinv\":\"%s\",",ib_rinv.c_str());
-    res->printf("\"ib_rgrid\":\"%s\",",ib_rgrid.c_str());
-    res->printf("\"ib_rload\":\"%s\",",ib_rload.c_str());
-    res->printf("\"ib_rnline\":\"%s\",",ib_rnline.c_str());
-    res->printf("\"ib_rdc\":\"%s\",",ib_rdc.c_str());
-    res->printf("\"ib_rearth\":\"%s\",",ib_rearth.c_str());
     res->printf("\"ib_qinv\":\"%s\",",ib_qinv.c_str());
     res->printf("\"ib_qgrid\":\"%s\",",ib_qgrid.c_str());
     res->printf("\"ib_qload\":\"%s\",",ib_qload.c_str());
@@ -874,19 +1045,19 @@ void setupWebServer(){
 
 void setupOTA(){
   ArduinoOTA.setHostname("inverter");
-  ArduinoOTA.onStart([](){webUpdateActive=true;Serial.println("Start updating sketch");digitalWrite(LED_PIN,HIGH);});
-  ArduinoOTA.onEnd([](){Serial.println("\nEnd");digitalWrite(LED_PIN,LOW);});
-  ArduinoOTA.onProgress([](unsigned int progress,unsigned int total){Serial.printf("Progress: %u%%\r",(progress/(total/100)));});
+  ArduinoOTA.onStart([](){webUpdateActive=true;Serial.println("Початок оновлення прошивки");digitalWrite(LED_PIN,HIGH);});
+  ArduinoOTA.onEnd([](){Serial.println("\nКінець");digitalWrite(LED_PIN,LOW);});
+  ArduinoOTA.onProgress([](unsigned int progress,unsigned int total){Serial.printf("Прогрес: %u%%\r",(progress/(total/100)));});
   ArduinoOTA.onError([](ota_error_t error){
-    Serial.printf("Error[%u]: ",error);
-    if(error==OTA_AUTH_ERROR)Serial.println("Auth Failed");
-    else if(error==OTA_BEGIN_ERROR)Serial.println("Begin Failed");
-    else if(error==OTA_CONNECT_ERROR)Serial.println("Connect Failed");
-    else if(error==OTA_RECEIVE_ERROR)Serial.println("Receive Failed");
-    else if(error==OTA_END_ERROR)Serial.println("End Failed");
+    Serial.printf("Помилка[%u]: ",error);
+    if(error==OTA_AUTH_ERROR)Serial.println("Помилка автентифікації");
+    else if(error==OTA_BEGIN_ERROR)Serial.println("Помилка початку");
+    else if(error==OTA_CONNECT_ERROR)Serial.println("Помилка з'єднання");
+    else if(error==OTA_RECEIVE_ERROR)Serial.println("Помилка отримання");
+    else if(error==OTA_END_ERROR)Serial.println("Помилка завершення");
     webUpdateActive=false;digitalWrite(LED_PIN,LOW);
   });
-  ArduinoOTA.begin();Serial.println("OTA Ready");
+  ArduinoOTA.begin();Serial.println("OTA готовий");
 }
 
 void setup(){
@@ -898,12 +1069,14 @@ void setup(){
   wifiSsid=preferences.getString("ssid","");
   wifiPassword=preferences.getString("password","");
   preferences.end();
+  loadEnergy();
   if(wifiSsid.length()>0){
     WiFi.mode(WIFI_STA);WiFi.begin(wifiSsid.c_str(),wifiPassword.c_str());
     unsigned long startWifi=millis();
     while(WiFi.status()!=WL_CONNECTED&&(millis()-startWifi<WIFI_CONNECT_TIMEOUT_MS))delay(300);
   }
   if(WiFi.status()!=WL_CONNECTED){startSetupAP();return;}
+  configTzTime("EET-2EEST-3,M3.5.0/3,M10.5.0/4","pool.ntp.org","time.google.com");
   MDNS.begin("inverter");
   Serial1.begin(19200,SERIAL_8N1,RX2_PIN,TX2_PIN);
   node.begin(SLAVE_ID,Serial1);
@@ -926,5 +1099,8 @@ void loop(){
   if(WiFi.status()!=WL_CONNECTED){
     if(currentMs-lastWifiReconnectMs>=WIFI_RECONNECT_INTERVAL_MS){lastWifiReconnectMs=currentMs;WiFi.reconnect();}
   }
+  static unsigned long lastTimeCheckMs=0,lastEnergySaveMs=0;
+  if(currentMs-lastTimeCheckMs>=30000){lastTimeCheckMs=currentMs;checkTimeRollover();}
+  if(currentMs-lastEnergySaveMs>=300000){lastEnergySaveMs=currentMs;saveEnergy();}
   ArduinoOTA.handle();
 }
