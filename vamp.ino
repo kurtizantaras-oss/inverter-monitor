@@ -12,7 +12,7 @@
 #define RS485_CTRL 4
 #define SLAVE_ID 0x04
 #define LED_PIN 2
-#define SKETCH_VERSION "6.3.6"
+#define SKETCH_VERSION "6.3.11"
 #define SERIAL_BUF_SIZE 4096
 
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 12000;
@@ -33,13 +33,16 @@ float cfgBattOffVoltage = 0.0f;
 float cfgBattOffCurrent = 0.0f;
 float cfgFullChargeCurrentA = 0.0f;
 float cfgFullChargeVoltage = 0.0f;
+float battV = 0.0f;
 
 int32_t freePower = 0;
 int32_t currentPower = 0;
 int32_t pvPower = 0;
 int32_t invPower = 0;
+float battI = 0.0f;
+float battPower = 0.0f;
 
-static char targMessageGlobal[64] = "--";
+static char targMessageGlobal[128] = "--";
 
 static char serialBuf[SERIAL_BUF_SIZE];
 static volatile uint16_t serialHead = 0;
@@ -76,8 +79,15 @@ unsigned long lastUpdateMs = 0, lastWifiReconnectMs = 0;
 bool needRestart = false;
 unsigned long restartRequestedMs = 0;
 
-void preTrans() { digitalWrite(RS485_CTRL, HIGH); delayMicroseconds(100); }
-void postTrans() { delayMicroseconds(100); Serial1.flush(); digitalWrite(RS485_CTRL, LOW); }
+void preTrans() {
+  digitalWrite(RS485_CTRL, HIGH);
+  delayMicroseconds(100);
+}
+void postTrans() {
+  delayMicroseconds(100);
+  Serial1.flush();
+  digitalWrite(RS485_CTRL, LOW);
+}
 
 template<typename T>
 bool readModbusBlock(uint16_t addr, uint8_t qty, T* buf) {
@@ -151,7 +161,6 @@ void pollModbusOnce() {
   float invV  = (inv.inv[1] != 65535) ? (float)inv.inv[1] : 0.0f;
   float invI  = (inv.inv[11] != 65535) ? inv.inv[11] / 10.0f : 0.0f;
 
-  float battV;
   if (inv.inv[4] != 0 && inv.inv[4] != 65535) {
     battV = inv.inv[4] / 10.0f;
   } else {
@@ -162,6 +171,14 @@ void pollModbusOnce() {
   invPower = (int32_t)round(invV * invI);
   freePower = pvPower - invPower;
 
+  battI = (battV > 0) ? ((float)freePower / battV) : 0.0f;
+  battPower = battV * battI;
+
+  // otnimaem zapas zaryadki na  akb
+  if (battV < cfgFullChargeVoltage || pvI < cfgFullChargeCurrentA) {
+    freePower -= (int32_t)(pvV * cfgFullChargeCurrentA);
+  }
+  
   const char* targMessage = "Все добре";
 
   if (inv.inv[0] != 2) {
@@ -181,18 +198,13 @@ void pollModbusOnce() {
     currentPower = 0;
     targMessage = "Струм акамулятора менше встановленого мінімуму";
   } else {
-    // otnimaem zapas zaryadki na  akb
-    if (battV < cfgFullChargeVoltage || pvI < cfgFullChargeCurrentA) {
-      freePower -= (int32_t)(pvV * cfgFullChargeCurrentA);
-    }
     if (freePower < 0) {
       currentPower -= freePower;
       targMessage = "Недостатньо потужності";
     } else if (freePower == 0) {
       targMessage = "Потужність на максимумі";
-    // esli freepower > 0 
     } else {
-      if (freePower  > 19) {
+      if (freePower > 19) {
         currentPower += 20;
         targMessage = "Потужність збільшена на 20 ВА";
       } else {
@@ -201,17 +213,17 @@ void pollModbusOnce() {
       }
     }
     if (currentPower >= cfgMaxAllocatedVA) {
-        currentPower = cfgMaxAllocatedVA;
-        targMessage = "Потужність обрізано до максимуму.";
-      }
+      currentPower = cfgMaxAllocatedVA;
+      targMessage = "Потужність обрізано до максимуму.";
+    }
   }
 
   strncpy(targMessageGlobal, targMessage, sizeof(targMessageGlobal) - 1);
   targMessageGlobal[sizeof(targMessageGlobal) - 1] = '\0';
 
-  char logLine[200];
-  snprintf(logLine, sizeof(logLine), "[%lu] ws=%d pvV=%.1f pvI=%.1f invV=%.0f invI=%.1f battV=%.1f pvP=%d invP=%d free=%d cur=%d msg=%s\n",
-           millis(), inv.workState, pvV, pvI, invV, invI, battV, pvPower, invPower, freePower, currentPower, targMessage);
+  char logLine[256];
+  snprintf(logLine, sizeof(logLine), "[%lu] ws=%d pvV=%.1f pvI=%.1f invV=%.0f invI=%.1f battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d msg=%s\n",
+           millis(), inv.workState, pvV, pvI, invV, invI, battV, battI, battPower, pvPower, invPower, freePower, currentPower, targMessage);
   serialLog(logLine);
 
   xSemaphoreGive(dataMutex);
@@ -222,58 +234,155 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Inverter</title>
 <style>
-body{background:#0f0f0f;color:#e6e6e6;font-family:monospace;padding:15px;margin:0}
-h1{color:#00ff88;text-align:center;font-size:18px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:15px 0}
-.card{background:#1c1c1c;border-radius:10px;padding:12px;text-align:center}
-.lb{color:#888;font-size:11px;margin-bottom:6px}
-.vl{font-size:20px;font-weight:bold;white-space:pre-line}
-.vl.g{color:#00ff88}.vl.b{color:#4da3ff}.vl.r{color:#ff4d4d}.vl.y{color:#ffd166}
-.btn{background:#00ff88;color:#000;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold;margin:3px}
-.bw{background:#ffd166}.bg{background:#555;color:#fff}.br{background:#ff4d4d;color:#fff}
-.ctr{text-align:center;margin:10px 0}
-.st{text-align:center;color:#4da3ff;font-size:14px;margin:10px 0}
-.full-width{grid-column:1/-1}
+body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;padding:12px;margin:0;display:flex;flex-direction:column;align-items:center}
+.dashboard{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;width:100%;max-width:960px;align-items:stretch}
+.col{display:flex;flex-direction:column;gap:12px}
+.panel{background:#1e1e1e;border-radius:10px;padding:14px;box-shadow:0 4px 6px rgba(0,0,0,.3);flex:1;display:flex;flex-direction:column}
+.panel-header{display:flex;align-items:center;gap:8px;color:#888;font-size:11px;font-weight:bold;letter-spacing:1px;margin-bottom:12px;text-transform:uppercase}
+.panel-header svg{width:14px;height:14px;fill:#ffd166}
+.panel-header.blue svg{fill:#4da3ff}
+.grid-2x2{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex:1;grid-auto-rows:1fr}
+.metric{text-align:center;background:#252525;border-radius:6px;padding:8px 6px;display:flex;flex-direction:column;justify-content:center}
+.metric .label{color:#666;font-size:9px;margin-bottom:4px;text-transform:uppercase}
+.metric .value{font-size:15px;font-weight:bold;font-family:monospace}
+.yellow{color:#ffd166}.blue{color:#4da3ff}.red{color:#ff4d4d}.green{color:#00ff88}
+.big-box{background:#252525;border-radius:6px;padding:10px;text-align:center;margin-top:8px;flex:1;display:flex;flex-direction:column;justify-content:center}
+.big-box .label{color:#888;font-size:11px;margin-bottom:4px;text-transform:uppercase}
+.big-box .value{font-size:20px;font-weight:bold;font-family:monospace}
+.stack{display:flex;flex-direction:column;gap:8px;flex:1}
+.stack .metric{flex:1}
+.center-panel{gap:10px;justify-content:space-between}
+.current-power-box{background:#161616;border-radius:6px;padding:12px;text-align:center;border:1px solid #2a2a2a}
+.current-power-box .label{color:#666;font-size:11px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px}
+.current-power-box .value{font-size:22px;font-weight:bold;color:#00ff88;font-family:monospace}
+.status-text{text-align:center;font-size:12px;font-weight:bold;line-height:1.6}
+.status-text .machine{color:#4da3ff}
+.status-text .state{color:#ffd166}
+.alert-box{border:2px solid #ff4d4d;border-radius:6px;padding:12px;background:rgba(255,77,77,.05);min-height:72px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;text-align:center}
+.alert-box .value{color:#ff4d4d;font-size:13px;font-weight:bold;line-height:1.4;word-wrap:break-word;overflow-wrap:break-word;word-break:break-word;max-width:100%}
+.free-power-box{background:#161616;border-radius:6px;padding:12px;text-align:center;border:1px solid #2a2a2a}
+.free-power-box .label{color:#666;font-size:11px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px}
+.free-power-box .value{font-size:22px;font-weight:bold;color:#00ff88;font-family:monospace}
+.controls{margin-top:15px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:960px}
+.btn{background:#333;color:#fff;border:1px solid #444;padding:7px 12px;border-radius:5px;cursor:pointer;font-size:11px;font-family:inherit;transition:background .2s}
+.btn:hover{background:#444}
+.btn.primary{background:#00ff88;color:#000;border:none;font-weight:bold}
+.btn.warn{background:#ffd166;color:#000;border:none;font-weight:bold}
+.btn.danger{background:#ff4d4d;color:#fff;border:none;font-weight:bold}
+.update-section{background:#1e1e1e;padding:16px;border-radius:10px;margin-top:12px;width:100%;max-width:500px;box-sizing:border-box;display:none;box-shadow:0 4px 6px rgba(0,0,0,.3)}
+.update-section.active{display:block}
+@media(max-width:768px){.dashboard{grid-template-columns:1fr}}
 </style></head><body>
-<h1>Inverter Monitor</h1>
-<div class="st" id="state">--</div>
 
-<div class="grid">
-<div class="card"><div class="lb">BATT VOLTAGE</div><div class="vl y" id="battV">--</div></div>
-<div class="card"><div class="lb">PV VOLTAGE (15205)</div><div class="vl y" id="pvV">--</div></div>
-<div class="card"><div class="lb">PV CURRENT (15207)</div><div class="vl g" id="pvI">--</div></div>
-<div class="card"><div class="lb">PV POWER</div><div class="vl y" id="pvPwr">--</div></div>
-<div class="card"><div class="lb">INV VOLTAGE (25202)</div><div class="vl b" id="invV">--</div></div>
-<div class="card"><div class="lb">INV CURRENT (25212)</div><div class="vl b" id="invI">--</div></div>
-<div class="card"><div class="lb">INV POWER</div><div class="vl r" id="invPwr">--</div></div>
-<div class="card"><div class="lb">FREE POWER</div><div class="vl y" id="freeP">--</div></div>
-<div class="card"><div class="lb">CURRENT POWER</div><div class="vl b" id="curP">--</div></div>
-<div class="card"><div class="lb">Solar gen.</div><div class="vl y" id="pvAccum">--</div></div>
-<div class="card"><div class="lb">Accum. disch.</div><div class="vl r" id="accDis">--</div></div>
-<div class="card full-width"><div class="lb">Heater shutdown reason</div><div class="vl" id="targMsg">--</div></div>
+<div class="dashboard">
+  <!-- LEFT COLUMN -->
+  <div class="col">
+    <div class="panel">
+      <div class="panel-header">
+        <svg viewBox="0 0 24 24"><path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.03 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.03 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.03 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.03 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.03 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06zM7.05 18.36c.39-.39.39-1.03 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41.39.39 1.03.39 1.41 0l1.06-1.06z"/></svg>
+        SOLAR POWER
+      </div>
+      <div class="grid-2x2">
+        <div class="metric"><div class="label">PV VOLTAGE (15205)</div><div class="value yellow" id="pvV">--</div></div>
+        <div class="metric"><div class="label">PV CURRENT (15207)</div><div class="value yellow" id="pvI">--</div></div>
+      </div>
+      <div class="big-box">
+        <div class="label">PV POWER (NOW)</div>
+        <div class="value yellow" id="pvPwr">--</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header blue">
+        <svg viewBox="0 0 24 24"><path d="M13 3h-2v10h2V3zm4.83 2.17l-1.42 1.42C17.99 7.86 19 9.81 19 12c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-2.19 1.01-4.14 2.58-5.42L6.17 5.17C4.23 6.82 3 9.26 3 12c0 4.97 4.03 9 9 9s9-4.03 9-9c0-2.74-1.23-5.18-3.17-6.83z"/></svg>
+        INVERTOR POWER
+      </div>
+      <div class="grid-2x2">
+        <div class="metric"><div class="label">INV VOLTAGE (25202)</div><div class="value blue" id="invV">--</div></div>
+        <div class="metric"><div class="label">INV CURRENT (25212)</div><div class="value blue" id="invI">--</div></div>
+      </div>
+      <div class="big-box">
+        <div class="label">INV POWER</div>
+        <div class="value red" id="invPwr">--</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CENTER COLUMN -->
+  <div class="col">
+    <div class="panel center-panel">
+      <div class="current-power-box">
+        <div class="label">CURRENT HEATER POWER</div>
+        <div class="value" id="curP">0 VA</div>
+      </div>
+      <div class="status-text">
+        <span class="machine" id="machineInfo">--</span><br>
+        <span class="state" id="stateInfo">--</span>
+      </div>
+      <div class="alert-box" id="alertBox">
+        <div class="value" id="targMsg">--</div>
+      </div>
+      <div class="free-power-box">
+        <div class="label">FREE POWER</div>
+        <div class="value" id="freeP">0 VA</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT COLUMN -->
+  <div class="col">
+    <div class="panel">
+      <div class="panel-header blue">
+        <svg viewBox="0 0 24 24"><path d="M15.67 4H14V2h-4v2H8.33C7.6 4 7 4.6 7 5.33v15.33C7 21.4 7.6 22 8.33 22h7.33c.74 0 1.34-.6 1.34-1.33V5.33C17 4.6 16.4 4 15.67 4zM11 20v-5.5H9L13 7v5.5h2L11 20z"/></svg>
+        BATTERY
+      </div>
+      <div class="grid-2x2">
+        <div class="metric"><div class="label">BATTERY VOLTAGE</div><div class="value blue" id="battV">--</div></div>
+        <div class="metric"><div class="label">BATTERY CURRENT</div><div class="value blue" id="battI">--</div></div>
+      </div>
+      <div class="big-box">
+        <div class="label">BATTERY POWER</div>
+        <div class="value" id="battPwr">--</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <svg viewBox="0 0 24 24"><path d="M11 21h-1l1-7H7.5c-.58 0-.57-.32-.38-.66.19-.34.05-.08.07-.12C8.48 10.94 10.42 7.54 13 3h1l-1 7h3.5c.49 0 .56.33.47.51l-.07.15C12.96 17.55 11 21 11 21z"/></svg>
+        POWER INFO
+      </div>
+      <div class="stack">
+        <div class="metric"><div class="label">PV POWER</div><div class="value yellow" id="pvAccum">--</div></div>
+        <div class="metric"><div class="label">ACCUM LOAD</div><div class="value red" id="accDis">--</div></div>
+        <div class="metric"><div class="label">ACCUM SELF USE</div><div class="value green" id="accChg">--</div></div>
+      </div>
+    </div>
+  </div>
 </div>
 
-<div class="ctr">
-<button class="btn" onclick="update()">Refresh</button>
+<div class="controls">
+<button class="btn primary" onclick="update()">Refresh</button>
 <button class="btn" onclick="location.href='/settings'">Settings</button>
-<button class="btn bw" onclick="resetCounters()">Reset counters</button>
-<button class="btn bg" onclick="resetWifi()">Reset WiFi</button>
-<button class="btn br" onclick="restartEsp()">Restart ESP</button>
+<button class="btn warn" onclick="resetCounters()">Reset counters</button>
+<button class="btn" onclick="resetWifi()">Reset WiFi</button>
+<button class="btn danger" onclick="restartEsp()">Restart ESP</button>
+<button class="btn" onclick="location.href='/serial'">Serial Monitor</button>
+<button class="btn" onclick="toggleUpdate()">Firmware Update</button>
 </div>
-<div class="ctr">
-<button class="btn bg" onclick="location.href='/serial'">Serial Monitor</button>
+
+<div class="update-section" id="updateSection">
+<b style="color:#00ff88;font-size:11px">FIRMWARE UPDATE</b><br><br>
+<input type="file" id="fwfile" accept=".bin" style="width:100%;padding:6px;background:#333;color:#fff;border:1px solid #555;border-radius:5px;box-sizing:border-box;font-size:11px">
+<button class="btn primary" onclick="doUpdate()" style="width:100%;margin-top:6px">Update firmware</button>
+<div id="prog" style="height:3px;background:#333;border-radius:2px;margin-top:6px;overflow:hidden;display:none"><div id="pbar" style="height:100%;width:0;background:#00ff88"></div></div>
+<div id="ust" style="font-size:9px;color:#888;margin-top:4px">Select .bin file</div>
 </div>
-<div style="background:#1c1c1c;padding:12px;border-radius:8px;margin-top:15px">
-<b style="color:#00ff88">FIRMWARE UPDATE</b><br><br>
-<input type="file" id="fwfile" accept=".bin" style="width:100%;padding:8px;background:#333;color:#fff;border:1px solid #555;border-radius:6px;box-sizing:border-box">
-<button class="btn" onclick="doUpdate()" style="width:100%;margin-top:8px">Update firmware</button>
-<div id="prog" style="height:6px;background:#333;border-radius:3px;margin-top:8px;overflow:hidden;display:none"><div id="pbar" style="height:100%;width:0;background:#00ff88"></div></div>
-<div id="ust" style="font-size:11px;color:#888;margin-top:5px">Select .bin file</div>
-</div>
+
 <script>
 function wsStr(v){switch(v){case 0:return"POWER ON";case 1:return"SELFTEST";case 2:return"OFF GRID";case 3:return"GRID TIE";case 4:return"BYPASS";case 5:return"STOP";case 6:return"GRID CHRG";default:return"UNKNOWN"}}
 function mpptStr(v){switch(v){case 0:return"Stop";case 1:return"MPPT";case 2:return"Current limit";default:return"--"}}
 function chgStr(v){switch(v){case 0:return"Stop";case 1:return"Charging";case 2:return"Float";default:return"--"}}
+function toggleUpdate(){document.getElementById("updateSection").classList.toggle("active")}
 async function resetWifi(){if(confirm("Reset WiFi?")){await fetch("/reset_wifi");location.reload()}}
 async function resetCounters(){if(!confirm("Reset all counters?"))return;await fetch("/reset_counters");alert("Done")}
 async function restartEsp(){if(!confirm("Restart ESP32?"))return;await fetch("/restart");alert("Restarting...");setTimeout(()=>location.reload(),5000)}
@@ -292,49 +401,76 @@ x.onerror=()=>document.getElementById("ust").innerText="Connection error";
 x.send(fd)}
 async function update(){
 try{let d=await(await fetch("/api")).json();
-document.getElementById("state").innerText="State: "+wsStr(d.ws)+" | "+d.mt+" "+d.mp+" | MPPT: "+mpptStr(d.pv[0])+" | CHG: "+chgStr(d.pv[1]);
-let rawInvV=d.inv[2],rawInvI=d.inv[3],rawPvV=d.pv[4],rawPvI=d.pv[6];
-let invV=(rawInvV!=null&&rawInvV!==65535)?String(rawInvV):"--";
-let invI=(rawInvI!=null&&rawInvI!==65535)?(rawInvI/10).toFixed(1):"--";
+
+document.getElementById("machineInfo").innerText=((d.mt&&d.mt!=="UNKNOWN")?d.mt+" ":"")+((d.mp&&d.mp!=="—")?d.mp:"");
+document.getElementById("stateInfo").innerText=wsStr(d.ws)+" | MPPT: "+mpptStr(d.pv[0])+" | CHG: "+chgStr(d.pv[1]);
+
+let rawPvV=d.pv[4],rawPvI=d.pv[6];
 let pvV=(rawPvV!=null&&rawPvV!==65535)?(rawPvV/10).toFixed(1):"--";
 let pvI=(rawPvI!=null&&rawPvI!==65535)?(rawPvI/10).toFixed(1):"--";
 let pvP=(pvV!=="--"&&pvI!=="--")?Math.round(rawPvV/10*rawPvI/10):"--";
-let invP=(invV!=="--"&&invI!=="--")?Math.round(rawInvV*rawInvI/10):"--";
 document.getElementById("pvV").innerText=pvV==="--"?"--":pvV+" V";
 document.getElementById("pvI").innerText=pvI==="--"?"--":pvI+" A";
 document.getElementById("pvPwr").innerText=pvP==="--"?"--":pvP+" VA";
-document.getElementById("invV").innerText=invV==="--"?"--":invV+" V";
-document.getElementById("invI").innerText=invI==="--"?"--":invI+" A";
-document.getElementById("invPwr").innerText=invP==="--"?"--":invP+" VA";
-document.getElementById("freeP").innerText=d.fp+" VA";
-document.getElementById("curP").innerText=d.cp+" VA";
-
-let rawBv=d.bv;
-let rawPvBatt=d.pv[5];
-let battV;
-if(rawBv!=null&&rawBv!==0&&rawBv!==65535){
-  battV=(rawBv/10).toFixed(1);
-}else if(rawPvBatt!=null&&rawPvBatt!==65535){
-  battV=(rawPvBatt/10).toFixed(1);
-}else{
-  battV="--";
-}
-document.getElementById("battV").innerText=battV==="--"?"--":battV+" V";
 
 let pvHi=d.pv[7],pvLo=d.pv[8];
 if(pvHi!=null&&pvHi!==65535&&pvLo!=null&&pvLo!==65535){
   document.getElementById("pvAccum").innerText=(pvHi*1000+pvLo/10).toFixed(1)+" kWh";
 }else{document.getElementById("pvAccum").innerText="--"}
 
-let acHi=d.inv[4],acLo=d.inv[5];
-if(acHi!=null&&acHi!==65535&&acLo!=null&&acLo!==65535){
-  document.getElementById("accDis").innerText=(acHi*1000+acLo/10).toFixed(1)+" kWh";
+let rawInvV=d.inv[2],rawInvI=d.inv[3];
+let invV=(rawInvV!=null&&rawInvV!==65535)?String(rawInvV):"--";
+let invI=(rawInvI!=null&&rawInvI!==65535)?(rawInvI/10).toFixed(1):"--";
+let invP=(invV!=="--"&&invI!=="--")?Math.round(rawInvV*rawInvI/10):"--";
+document.getElementById("invV").innerText=invV==="--"?"--":invV+" V";
+document.getElementById("invI").innerText=invI==="--"?"--":invI+" A";
+document.getElementById("invPwr").innerText=invP==="--"?"--":invP+" VA";
+
+let battV=(d.battV!=null&&d.battV>0)?d.battV.toFixed(1):"--";
+document.getElementById("battV").innerText=battV==="--"?"--":battV+" V";
+
+let battIVal=(d.battI!=null)?d.battI:null;
+let battIEl=document.getElementById("battI");
+if(battIVal!==null){
+  battIEl.innerText=battIVal.toFixed(1)+" A";
+  battIEl.className="value "+(battIVal>0?"blue":"red");
+}else{
+  battIEl.innerText="--";
+  battIEl.className="value blue";
+}
+
+let battPwrVal=(d.battPower!=null)?d.battPower:null;
+let battPwrEl=document.getElementById("battPwr");
+if(battPwrVal!==null){
+  battPwrEl.innerText=Math.round(battPwrVal)+" VA";
+  battPwrEl.className="value "+(battPwrVal>=0?"blue":"red");
+}else{
+  battPwrEl.innerText="--";
+  battPwrEl.className="value blue";
+}
+
+let acDisHi=d.acDisHi,acDisLo=d.acDisLo;
+if(acDisHi!=null&&acDisHi!==65535&&acDisLo!=null&&acDisLo!==65535){
+  document.getElementById("accDis").innerText=(acDisHi*1000+acDisLo/10).toFixed(1)+" kWh";
 }else{document.getElementById("accDis").innerText="--"}
+
+let acChgHi=d.acChgHi,acChgLo=d.acChgLo;
+if(acChgHi!=null&&acChgHi!==65535&&acChgLo!=null&&acChgLo!==65535){
+  document.getElementById("accChg").innerText=(acChgHi*1000+acChgLo/10).toFixed(1)+" kWh";
+}else{document.getElementById("accChg").innerText="--"}
+
+document.getElementById("curP").innerText=d.cp+" VA";
+document.getElementById("freeP").innerText=d.fp+" VA";
 
 let tm=d.tm||"--";
 let tmEl=document.getElementById("targMsg");
+let box=document.getElementById("alertBox");
 tmEl.innerText=tm;
-tmEl.className="vl "+(tm==="Все добре"?"g":"r");
+if(tm==="Все добре"){
+  tmEl.style.color="#00ff88";box.style.borderColor="#00ff88";box.style.background="rgba(0,255,136,0.05)";
+}else{
+  tmEl.style.color="#ff4d4d";box.style.borderColor="#ff4d4d";box.style.background="rgba(255,77,77,0.05)";
+}
 }catch(e){console.error(e)}}
 setInterval(update,1000);update();
 </script></body></html>
@@ -530,12 +666,16 @@ void setupWebServer() {
     bool locked = dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE;
     auto* res = r->beginResponseStream("application/json");
     res->printf("{\"ws\":%d,\"mt\":\"%s\",\"mp\":\"%s\",\"fp\":%d,\"cp\":%d,\"maVA\":%u,\"tm\":\"%s\","
-                "\"bv\":%u,"
+                "\"battV\":%.1f,\"battI\":%.1f,\"battPower\":%.1f,"
                 "\"inv\":[%u,%u,%u,%u,%u,%u],"
+                "\"acDisHi\":%u,\"acDisLo\":%u,"
+                "\"acChgHi\":%u,\"acChgLo\":%u,"
                 "\"pv\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}",
                 inv.workState, inv.machineType.c_str(), inv.machinePower.c_str(), freePower, currentPower, cfgMaxAllocatedVA, targMessageGlobal,
-                inv.inv[4],
+                battV, battI, battPower,
                 inv.inv[0], inv.inv[2], inv.inv[1], inv.inv[11], inv.inv[46], inv.inv[47],
+                inv.inv[52], inv.inv[53],
+                inv.inv[54], inv.inv[55],
                 inv.pv[0], inv.pv[1], inv.pv[2], inv.pv[3], inv.pv[4], inv.pv[5], inv.pv[6], inv.pv[16], inv.pv[17], inv.pv[18]);
     r->send(res);
     if (locked) xSemaphoreGive(dataMutex);
