@@ -30,6 +30,7 @@ uint16_t cfgHeaterPowerVA = 0;
 uint16_t cfgMaxAllocatedVA = 0;
 float cfgUpdateIntervalSec = DEFAULT_UPDATE_INTERVAL_SEC;
 float cfgBattOffVoltage = 0.0f;
+float cfgBattHysteresisV = 0.25f;
 float cfgBattOffCurrent = 0.0f;
 float cfgFullChargeCurrentA = 0.0f;
 float cfgFullChargeVoltage = 0.0f;
@@ -114,6 +115,7 @@ void loadSettings() {
   cfgMaxAllocatedVA = preferences.getUShort("maxAllocVA", 0);
   cfgUpdateIntervalSec = constrain(preferences.getFloat("updIntSec", DEFAULT_UPDATE_INTERVAL_SEC), 0.5f, 10.0f);
   cfgBattOffVoltage = preferences.getFloat("battOffV", 0.0f);
+  cfgBattHysteresisV = constrain(preferences.getFloat("battHystV", 0.25f), 0.0f, 5.0f);
   cfgBattOffCurrent = preferences.getFloat("battOffI", 0.0f);
   cfgFullChargeCurrentA = constrain(preferences.getFloat("chgCurA", 0.0f), 0.0f, 100.0f);
   cfgFullChargeVoltage = constrain(preferences.getFloat("fullChgV", 0.0f), 20.0f, 30.0f);
@@ -126,6 +128,7 @@ void saveSettings() {
   preferences.putUShort("maxAllocVA", cfgMaxAllocatedVA);
   preferences.putFloat("updIntSec", cfgUpdateIntervalSec);
   preferences.putFloat("battOffV", cfgBattOffVoltage);
+  preferences.putFloat("battHystV", cfgBattHysteresisV);
   preferences.putFloat("battOffI", cfgBattOffCurrent);
   preferences.putFloat("chgCurA", cfgFullChargeCurrentA);
   preferences.putFloat("fullChgV", cfgFullChargeVoltage);
@@ -174,11 +177,22 @@ void pollModbusOnce() {
   battI = (battV > 0) ? ((float)freePower / battV) : 0.0f;
   battPower = battV * battI;
 
-  // otnimaem zapas zaryadki na  akb
   if (battV < cfgFullChargeVoltage || pvI < cfgFullChargeCurrentA) {
     freePower -= (int32_t)(pvV * cfgFullChargeCurrentA);
   }
   
+  static bool isBattLow = false;
+
+  if (cfgBattOffVoltage > 0.0f) {
+    if (battV < cfgBattOffVoltage) {
+      isBattLow = true;
+    } else if (battV >= cfgBattOffVoltage + cfgBattHysteresisV) {
+      isBattLow = false;
+    }
+  } else {
+    isBattLow = false;
+  }
+
   const char* targMessage = "Все добре";
 
   if (inv.inv[0] != 2) {
@@ -189,7 +203,7 @@ void pollModbusOnce() {
     freePower = 0;
     currentPower = 0;
     targMessage = "Вільна потужність відсутня";
-  } else if (battV < cfgBattOffVoltage) {
+  } else if (isBattLow) {
     freePower = 0;
     currentPower = 0;
     targMessage = "Напруга акамулятора менше встановленого мінімуму";
@@ -275,7 +289,6 @@ body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verda
 </style></head><body>
 
 <div class="dashboard">
-  <!-- LEFT COLUMN -->
   <div class="col">
     <div class="panel">
       <div class="panel-header">
@@ -308,7 +321,6 @@ body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verda
     </div>
   </div>
 
-  <!-- CENTER COLUMN -->
   <div class="col">
     <div class="panel center-panel">
       <div class="current-power-box">
@@ -329,7 +341,6 @@ body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verda
     </div>
   </div>
 
-  <!-- RIGHT COLUMN -->
   <div class="col">
     <div class="panel">
       <div class="panel-header blue">
@@ -528,31 +539,34 @@ input{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;background:#333
 <h2>General</h2>
 <div class="card">
 <label>Heater power (VA)</label>
-<div class="desc">Потужність приладу, що використовується</div>
+<div class="desc">Номінальна потужність вашого приладу (навантаження), наприклад ТЭНа, у вольт-амперах (ВА). Це базове значення, яке використовується системою для розрахунку допустимої потужності. Вказуйте потужність приладу, яка зазначена на шильдику або в паспорті. Якщо встановлено 0, система не використовує це обмеження.</div>
 <input type="number" id="heaterVA" min="0" max="99999" value="0">
 <label>Max allocated power (VA)</label>
-<div class="desc">Максимальна потужність, яку можна виділити, але не більше ніж потужність інвертора</div>
+<div class="desc">Максимальна потужність у ВА, яку система може виділити на ваш прилад. Це жорстке обмеження, яке запобігає перевантаженню інвертора або проводки. Навіть якщо вільна потужність від сонячних панелей вища, потужність приладу не перевищить це значення. Рекомендується встановлювати не більше номінальної потужності інвертора та потужності приладу. Якщо встановлено 0, обмеження не діє.</div>
 <input type="number" id="maxAllocVA" min="0" max="99999" value="0">
 <label>Update interval (sec)</label>
-<div class="desc">Період оновлення даних з інвертора, рекомендується 1 сек.</div>
+<div class="desc">Інтервал опитування інвертора по Modbus у секундах. Визначає, як часто система зчитує дані про напругу, струм та потужність. Занадто малий інтервал (менше 1 сек) може перевантажити інтерфейс або інвертор, занадто великий призведе до запізнень у реакції на зміни. Рекомендований діапазон: 1-3 сек. За замовчуванням 2 сек.</div>
 <input type="number" id="updIntSec" min="0.5" max="10" step="0.5" value="2">
 </div>
 <h2>Load shutdown</h2>
 <div class="card">
 <label>Shutdown voltage (V)</label>
-<div class="desc">Напруга акамулятора нижче якої вимикається ваш прилад (Налаштування інвертора Floating voltage +0.2-0.5 V)</div>
+<div class="desc">Критична напруга акумулятора, при якій навантаження примусово вимикається для захисту акумулятора від глибокого розряду. Вимірюється на клемах акумулятора. Рекомендується встановлювати на рівні напруги, нижче якої розряд акумулятора стає небезпечним. Наприклад, для LiFePO4 12В це ~11.5-12.0В, для AGM/GEL ~11.8-12.2В. Також враховуйте налаштування інвертора (зазвичай Floating voltage +0.2-0.5 В). Якщо встановлено 0, захист по напрузі вимкнено.</div>
 <input type="number" id="battOffV" min="0" max="99.9" step="0.1" value="0">
+<label>Hysteresis (V)</label>
+<div class="desc">Гістерезис напруги (В). Різниця між напругою відключення і напругою повторного включення навантаження. Запобігає частому перемиканню (дребезгу) реле при коливаннях напруги. Наприклад, якщо встановлено 22.0 В і гістерезис 0.3 В, прилад вимкнеться при 22.0 В, а увімкнеться назад тільки коли напруга підніметься до 22.3 В. Рекомендовано 0.2 - 0.5 В. Якщо встановлено 0, гістерезис відсутній (може призвести до частих перемикань).</div>
+<input type="number" id="battHystV" min="0" max="5" step="0.1" value="0.25">
 <label>Shutdown current (A)</label>
-<div class="desc">Струм на акамуляторі нижче якого вимикається ваш прилад</div>
+<div class="desc">Мінімальний струм акумулятора, при якому дозволяється робота навантаження. Якщо струм акумулятора нижчий за це значення (наприклад, сонячні панелі не дають достатньо енергії або акумулятор розряджений), прилад вимикається. Може використовуватися для захисту від роботи при дуже низькому зарядному струмі. Якщо встановлено 0, захист по струму вимкнено.</div>
 <input type="number" id="battOffI" min="0" max="999.9" step="0.1" value="0">
 </div>
 <h2>Battery charging</h2>
 <div class="card">
 <label>Charge current (A)</label>
-<div class="desc">Струм зарядки акамулятора при роботі вашого приладу</div>
+<div class="desc">Струм, який резервується для зарядки акумулятора під час роботи приладу. Система віднімає цю потужність (напруга акумулятора × зарядний струм) від вільної потужності сонячних панелей, щоб акумулятор отримував заряд. Наприклад, якщо вільна потужність 500 ВА, а зарядний струм 10 А при напрузі 24 В, на прилад піде лише 500 - 240 = 260 ВА. Якщо встановлено 0, вся вільна потужність іде на прилад, акумулятор не заряджається.</div>
 <input type="number" id="chgCurA" min="0" max="100" step="1" value="0">
 <label>Full charge voltage (V)</label>
-<div class="desc">Максимальна напруга зарядки акамулятора, якщо напруга вище, то зарядка акамулятора зупиняється (все буде йти на ваш прилад)</div>
+<div class="desc">Напруга, при якій акумулятор вважається повністю зарядженим. Якщо напруга акумулятора вища за це значення, система перестає резервувати потужність на зарядку і вся вільна енергія йде на ваш прилад. Це запобігає перезаряду акумулятора. Встановлюйте відповідно до типу акумулятора: для LiFePO4 12В ~14.2-14.6 В, для AGM ~14.4-14.8 В, для GEL ~14.1-14.4 В. Працює в парі з параметром «Струм зарядки». Якщо встановлено 0, функція не діє.</div>
 <input type="number" id="fullChgV" min="20" max="30" step="0.1" value="0">
 </div>
 <div style="text-align:center;margin-top:15px">
@@ -561,9 +575,9 @@ input{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;background:#333
 </div>
 <script>
 async function load(){try{let d=await(await fetch("/api_settings")).json();
-["heaterVA","maxAllocVA","updIntSec","battOffV","battOffI","chgCurA","fullChgV"].forEach(k=>document.getElementById(k).value=d[k])}catch(e){}}
+["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","battOffI","chgCurA","fullChgV"].forEach(k=>document.getElementById(k).value=d[k])}catch(e){}}
 async function save(){
-let body=["heaterVA","maxAllocVA","updIntSec","battOffV","battOffI","chgCurA","fullChgV"].map(k=>k+"="+document.getElementById(k).value).join("&");
+let body=["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","battOffI","chgCurA","fullChgV"].map(k=>k+"="+document.getElementById(k).value).join("&");
 if((await fetch("/save_settings",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body})).status==200){
 document.getElementById("msg").style.display="block";setTimeout(()=>document.getElementById("msg").style.display="none",2000)}
 else alert("Save error!")}
@@ -641,8 +655,8 @@ void setupWebServer() {
   });
   server.on("/api_settings", HTTP_GET, [](AsyncWebServerRequest* r) {
     auto* res = r->beginResponseStream("application/json");
-    res->printf("{\"heaterVA\":%u,\"maxAllocVA\":%u,\"updIntSec\":%.1f,\"battOffV\":%.1f,\"battOffI\":%.1f,\"chgCurA\":%.1f,\"fullChgV\":%.1f}",
-                cfgHeaterPowerVA, cfgMaxAllocatedVA, cfgUpdateIntervalSec, cfgBattOffVoltage, cfgBattOffCurrent, cfgFullChargeCurrentA, cfgFullChargeVoltage);
+    res->printf("{\"heaterVA\":%u,\"maxAllocVA\":%u,\"updIntSec\":%.1f,\"battOffV\":%.1f,\"battHystV\":%.1f,\"battOffI\":%.1f,\"chgCurA\":%.1f,\"fullChgV\":%.1f}",
+                cfgHeaterPowerVA, cfgMaxAllocatedVA, cfgUpdateIntervalSec, cfgBattOffVoltage, cfgBattHysteresisV, cfgBattOffCurrent, cfgFullChargeCurrentA, cfgFullChargeVoltage);
     r->send(res);
   });
   server.on("/save_settings", HTTP_POST, [](AsyncWebServerRequest* r) {
@@ -650,6 +664,7 @@ void setupWebServer() {
     if (r->hasParam("maxAllocVA", true)) cfgMaxAllocatedVA = r->getParam("maxAllocVA", true)->value().toInt();
     if (r->hasParam("updIntSec", true)) cfgUpdateIntervalSec = constrain(r->getParam("updIntSec", true)->value().toFloat(), 0.5f, 10.0f);
     if (r->hasParam("battOffV", true)) cfgBattOffVoltage = r->getParam("battOffV", true)->value().toFloat();
+    if (r->hasParam("battHystV", true)) cfgBattHysteresisV = constrain(r->getParam("battHystV", true)->value().toFloat(), 0.0f, 5.0f);
     if (r->hasParam("battOffI", true)) cfgBattOffCurrent = r->getParam("battOffI", true)->value().toFloat();
     if (r->hasParam("chgCurA", true)) cfgFullChargeCurrentA = constrain(r->getParam("chgCurA", true)->value().toFloat(), 0.0f, 100.0f);
     if (r->hasParam("fullChgV", true)) cfgFullChargeVoltage = constrain(r->getParam("fullChgV", true)->value().toFloat(), 20.0f, 30.0f);
