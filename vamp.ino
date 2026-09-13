@@ -34,15 +34,31 @@ float cfgBattHysteresisV = 0.25f;
 float cfgBattOffCurrent = 0.0f;
 float cfgFullChargeCurrentA = 0.0f;
 float cfgFullChargeVoltage = 0.0f;
-float battV = 0.0f;
 
+// Глобальні змінні для зберігання стану та відображення
+float battV = 0.0f;
 int32_t freePower = 0;
 int32_t currentPower = 0;
 int32_t pvPower = 0;
 int32_t invPower = 0;
-int32_t PpowerHeater = 0;
 float battI = 0.0f;
 float battPower = 0.0f;
+
+float pvV = 0.0f;
+float pvI = 0.0f;
+float invV = 0.0f;
+float invI = 0.0f;
+
+uint16_t pvWork = 0;
+uint16_t mppt = 0;
+uint16_t chg = 0;
+
+uint32_t pvEnergyHi = 0;
+uint32_t pvEnergyLo = 0;
+uint32_t acDisHi = 0;
+uint32_t acDisLo = 0;
+uint32_t acChgHi = 0;
+uint32_t acChgLo = 0;
 
 bool switch_state = false;
 
@@ -53,6 +69,8 @@ static volatile uint16_t serialHead = 0;
 static volatile uint16_t serialTail = 0;
 static portMUX_TYPE serialMux = portMUX_INITIALIZER_UNLOCKED;
 
+int heaterPercent = 0;
+  
 void serialLog(const char* msg) {
   size_t len = strlen(msg);
   portENTER_CRITICAL(&serialMux);
@@ -164,7 +182,7 @@ void pollModbusOnce() {
   digitalWrite(LED_PIN, HIGH);
   if (!readModbusBlock(25201, 80, invBuf)) ok = false; delay(40);
   if (!readModbusBlock(15201, 20, pvBuf)) ok = false; delay(40);
-  if (!ok) return;
+  if (!ok) { digitalWrite(LED_PIN, LOW); return; }
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
   memcpy(inv.inv, invBuf, sizeof(inv.inv));
@@ -181,10 +199,11 @@ void pollModbusOnce() {
     default: inv.stateStr = "UNKNOWN"; break;
   }
 
-  float pvV   = (inv.pv[4] != 65535) ? inv.pv[4] / 10.0f : 0.0f;
-  float pvI   = (inv.pv[6] != 65535) ? inv.pv[6] / 10.0f : 0.0f;
-  float invV  = (inv.inv[5] != 65535) ? inv.inv[5] / 10.0f : 0.0f;
-  float invI  = (inv.inv[11] != 65535) ? inv.inv[11] / 10.0f : 0.0f;
+  // Оновлення глобальних змінних для відображення (з масивів Modbus)
+  pvV   = (inv.pv[4] != 65535) ? inv.pv[4] / 10.0f : 0.0f;
+  pvI   = (inv.pv[6] != 65535) ? inv.pv[6] / 10.0f : 0.0f;
+  invV  = (inv.inv[5] != 65535) ? inv.inv[5] / 10.0f : 0.0f;
+  invI  = (inv.inv[11] != 65535) ? inv.inv[11] / 10.0f : 0.0f;
 
   if (inv.inv[4] != 0 && inv.inv[4] != 65535) {
     battV = inv.inv[4] / 10.0f;
@@ -246,14 +265,32 @@ void pollModbusOnce() {
     }
   }
 
-  PpowerHeater = currentPower;
+  // Розрахунок відсотка для пакетного керування (Burst Control)
+  if (cfgHeaterPowerVA > 0 && switch_state) {
+    heaterPercent = (currentPower * 100) / cfgHeaterPowerVA;
+    if (heaterPercent > 100) heaterPercent = 100;
+    if (heaterPercent < 0) heaterPercent = 0;
+  } else {
+    heaterPercent = 0;
+  }
+
+  // Оновлення змінних лічильників та станів
+  pvEnergyHi = inv.pv[16];
+  pvEnergyLo = inv.pv[17];
+  acDisHi = inv.inv[52];
+  acDisLo = inv.inv[53];
+  acChgHi = inv.inv[54];
+  acChgLo = inv.inv[55];
+  pvWork = inv.pv[0];
+  mppt = inv.pv[1];
+  chg = inv.pv[2];
 
   strncpy(targMessageGlobal, targMessage, sizeof(targMessageGlobal) - 1);
   targMessageGlobal[sizeof(targMessageGlobal) - 1] = '\0';
 
   char logLine[256];
-  snprintf(logLine, sizeof(logLine), "[%lu] ws=%d pvV=%.1f pvI=%.1f invV=%.0f invI=%.1f battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d pph=%d sw=%d msg=%s\n",
-           millis(), inv.workState, pvV, pvI, invV, invI, battV, battI, battPower, pvPower, invPower, freePower, currentPower, PpowerHeater, switch_state ? 1 : 0, targMessage);
+  snprintf(logLine, sizeof(logLine), "[%lu] ws=%d pvV=%.1f pvI=%.1f invV=%.0f invI=%.1f battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d sw=%d msg=%s\n",
+           millis(), inv.workState, pvV, pvI, invV, invI, battV, battI, battPower, pvPower, invPower, freePower, currentPower, switch_state ? 1 : 0, targMessage);
   serialLog(logLine);
 
   xSemaphoreGive(dataMutex);
@@ -293,17 +330,17 @@ body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verda
 .free-power-box{background:#161616;border-radius:6px;padding:8px;text-align:center;border:1px solid #2a2a2a}
 .free-power-box .label{color:#666;font-size:10px;margin-bottom:2px;text-transform:uppercase;letter-spacing:1px}
 .free-power-box .value{font-size:18px;font-weight:bold;color:#00ff88;font-family:monospace}
-.heater-slider-box{background:#161616;border-radius:6px;padding:8px;text-align:center;border:1px solid #2a2a2a;margin-top:6px}
-.heater-slider-box .label{color:#666;font-size:10px;margin-bottom:2px;text-transform:uppercase;letter-spacing:1px}
-.slider-track{background:#333;border-radius:4px;height:12px;width:100%;margin-top:4px;overflow:hidden;position:relative}
-.slider-fill{height:100%;border-radius:4px;transition:width 0.4s ease, background-color 0.4s ease;width:0%}
-.slider-text{color:#888;font-size:10px;margin-top:4px;font-family:monospace}
-.switch-row{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:6px;padding:6px 10px;background:#161616;border-radius:6px;border:1px solid #2a2a2a}
-.switch-btn{background:none;border:none;cursor:pointer;padding:0;display:flex;align-items:center;gap:6px;transition:transform 0.15s}
-.switch-btn:hover{transform:scale(1.08)}
-.switch-btn:active{transform:scale(0.95)}
-.switch-btn svg{width:28px;height:28px;transition:fill 0.3s}
-.switch-label{color:#888;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:0.5px}
+.heater-slider-box{background:#161616;border-radius:6px;padding:6px 8px;text-align:center;border:1px solid #2a2a2a;margin-top:6px}
+.heater-slider-box .label{color:#666;font-size:10px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px}
+.slider-track{background:#2a2a2a;border-radius:6px;height:22px;width:100%;position:relative;overflow:hidden;box-shadow:inset 0 2px 4px rgba(0,0,0,0.4)}
+.slider-fill{height:100%;border-radius:6px;transition:width 0.4s ease,background 0.4s ease;width:0%;box-shadow:0 0 8px rgba(0,255,136,0.15)}
+.slider-text{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:11px;font-weight:bold;font-family:monospace;text-shadow:0 1px 3px rgba(0,0,0,0.9);z-index:2;pointer-events:none;letter-spacing:0.5px}
+.switch-row{display:flex;align-items:stretch;justify-content:center;gap:10px;margin-top:6px;padding:8px 12px;background:#161616;border-radius:6px;border:1px solid #2a2a2a;min-height:56px}
+.switch-btn{background:none;border:none;cursor:pointer;padding:6px 20px;display:flex;align-items:center;justify-content:center;gap:8px;transition:transform 0.15s,background 0.15s;align-self:stretch;border-radius:6px;min-width:90px}
+.switch-btn:hover{transform:scale(1.04);background:rgba(255,255,255,0.05)}
+.switch-btn:active{transform:scale(0.96)}
+.switch-btn svg{width:auto;height:100%;min-width:36px;max-width:52px;transition:fill 0.3s}
+.switch-label{color:#888;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:0.5px;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.3;text-align:center}
 .controls{margin-top:15px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:960px}
 .btn{background:#333;color:#fff;border:1px solid #444;padding:7px 12px;border-radius:5px;cursor:pointer;font-size:11px;font-family:inherit;transition:background .2s}
 .btn:hover{background:#444}
@@ -357,15 +394,15 @@ body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verda
       <div class="heater-slider-box">
         <div class="label">HEATER LOAD</div>
         <div class="slider-track">
-          <div id="hSlider" class="slider-fill" style="width: 0%; background: #00ff88;"></div>
+          <div id="hSlider" class="slider-fill" style="width:0%;background:#00ff88"></div>
+          <span id="hSliderText" class="slider-text">0%</span>
         </div>
-        <div id="hSliderText" class="slider-text">0%</div>
       </div>
       <div class="switch-row">
-        <span class="switch-label">ПЕРЕМИКАЧ СПОЖИВАННЯ</span>
+        <span class="switch-label">НАВАНТАЖЕННЯ</span>
         <button class="switch-btn" id="switchBtn" onclick="toggleSwitch()">
           <svg id="switchIcon" viewBox="0 0 24 24" fill="#555">
-            <path d="M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/>
+            <path id="switchPath" d="M7 7h10c2.76 0 5 2.24 5 5s-2.24 5-5 5H7c-2.76 0-5-2.24-5-5s2.24-5 5-5zm0 8c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3z"/>
           </svg>
         </button>
         <span class="switch-label" id="switchStatus" style="color:#888">OFF</span>
@@ -468,13 +505,16 @@ updateSwitchUI(data.state);
 
 function updateSwitchUI(state){
 let icon=document.getElementById("switchIcon");
+let path=document.getElementById("switchPath");
 let status=document.getElementById("switchStatus");
 if(state){
 icon.setAttribute("fill","#00ff88");
+path.setAttribute("d","M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z");
 status.innerText="ON";
 status.style.color="#00ff88";
 }else{
 icon.setAttribute("fill","#555");
+path.setAttribute("d","M7 7h10c2.76 0 5 2.24 5 5s-2.24 5-5 5H7c-2.76 0-5-2.24-5-5s2.24-5 5-5zm0 8c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3z");
 status.innerText="OFF";
 status.style.color="#888";
 }}
@@ -525,9 +565,8 @@ let hpct = d.hpct || 0;
 let hSlider = document.getElementById("hSlider");
 hSlider.style.width = hpct + "%";
 let hColor = hpct < 33 ? "#00ff88" : (hpct < 66 ? "#ffd166" : "#ff4d4d");
-hSlider.style.background = hColor;
+hSlider.style.background = "linear-gradient(90deg," + hColor + "88," + hColor + ")";
 document.getElementById("hSliderText").innerText = hpct + "%";
-document.getElementById("hSliderText").style.color = hColor;
 
 updateSwitchUI(d.sw);
 
@@ -604,34 +643,34 @@ input{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;background:#333
 <div class="card">
 <label>Heater power (VA)</label>
 <div class="desc">Номінальна потужність вашого приладу (навантаження), наприклад ТЭНа, у вольт-амперах (ВА). Це базове значення, яке використовується системою для розрахунку допустимої потужності. Вказуйте потужність приладу, яка зазначена на шильдику або в паспорті. Якщо встановлено 0, система не використовує це обмеження.</div>
-<input type="number" id="heaterVA" min="0" max="99999" value="0">
+<input type="number" id="heaterVA" min="0" max="15000" value="0">
 <label>Max allocated power (VA)</label>
 <div class="desc">Максимальна потужність у ВА, яку система може виділити на ваш прилад. Це жорстке обмеження, яке запобігає перевантаженню інвертора або проводки. Навіть якщо вільна потужність від сонячних панелей вища, потужність приладу не перевищить це значення. Рекомендується встановлювати не більше номінальної потужності інвертора та потужності приладу. Якщо встановлено 0, обмеження не діє.</div>
-<input type="number" id="maxAllocVA" min="0" max="99999" value="0">
+<input type="number" id="maxAllocVA" min="0" max="15000" value="0">
 <label>Update interval (sec)</label>
 <div class="desc">Інтервал опитування інвертора по Modbus у секундах. Визначає, як часто система зчитує дані про напругу, струм та потужність. Занадто малий інтервал (менше 1 сек) може перевантажити інтерфейс або інвертор, занадто великий призведе до запізнень у реакції на зміни. Рекомендований діапазон: 1-3 сек. За замовчуванням 2 сек.</div>
-<input type="number" id="updIntSec" min="0.5" max="10" step="0.5" value="2">
+<input type="number" id="updIntSec" min="0.5" max="10" step="0.1" value="2">
 </div>
 <h2>Load shutdown</h2>
 <div class="card">
 <label>Shutdown voltage (V)</label>
-<div class="desc">Критична напруга акумулятора, при якій навантаження примусово вимикається для захисту акумулятора від глибокого розряду. Вимірюється на клемах акумулятора. Рекомендується встановлювати на рівні напруги, нижче якої розряд акумулятора стає небезпечним. Наприклад, для LiFePO4 12В це ~11.5-12.0В, для AGM/GEL ~11.8-12.2В. Також враховуйте налаштування інвертора (зазвичай Floating voltage +0.2-0.5 В). Якщо встановлено 0, захист по напрузі вимкнено.</div>
-<input type="number" id="battOffV" min="0" max="99.9" step="0.1" value="0">
+<div class="desc">Критична напруга акумулятора, при якій навантаження примусово вимикається для захисту акумулятора від глибокого розряду. Вимірюється на клемах акумулятора. Рекомендується встановлювати на рівні напруги, нижче якої розряд акумулятора стає небезпечним. Також враховуйте налаштування інвертора (зазвичай Floating voltage +0.2-0.5 В). Якщо встановлено 0, захист по напрузі вимкнено.</div>
+<input type="number" id="battOffV" min="0" max="80" step="0.1" value="0">
 <label>Hysteresis (V)</label>
 <div class="desc">Гістерезис напруги (В). Різниця між напругою відключення і напругою повторного включення навантаження. Запобігає частому перемиканню (дребезгу) реле при коливаннях напруги. Наприклад, якщо встановлено 22.0 В і гістерезис 0.3 В, прилад вимкнеться при 22.0 В, а увімкнеться назад тільки коли напруга підніметься до 22.3 В. Рекомендовано 0.2 - 0.5 В. Якщо встановлено 0, гістерезис відсутній (може призвести до частих перемикань).</div>
-<input type="number" id="battHystV" min="0" max="5" step="0.1" value="0.25">
+<input type="number" id="battHystV" min="0" max="5" step="0.05" value="0.25">
 <label>Shutdown current (A)</label>
 <div class="desc">Мінімальний струм акумулятора, при якому дозволяється робота навантаження. Якщо струм акумулятора нижчий за це значення (наприклад, сонячні панелі не дають достатньо енергії або акумулятор розряджений), прилад вимикається. Може використовуватися для захисту від роботи при дуже низькому зарядному струмі. Якщо встановлено 0, захист по струму вимкнено.</div>
-<input type="number" id="battOffI" min="0" max="999.9" step="0.1" value="0">
+<input type="number" id="battOffI" min="0" max="150" step="1" value="0">
 </div>
 <h2>Battery charging</h2>
 <div class="card">
 <label>Charge current (A)</label>
 <div class="desc">Струм, який резервується для зарядки акумулятора під час роботи приладу. Система віднімає цю потужність (напруга акумулятора × зарядний струм) від вільної потужності сонячних панелей, щоб акумулятор отримував заряд. Наприклад, якщо вільна потужність 500 ВА, а зарядний струм 10 А при напрузі 24 В, на прилад піде лише 500 - 240 = 260 ВА. Якщо встановлено 0, вся вільна потужність іде на прилад, акумулятор не заряджається.</div>
-<input type="number" id="chgCurA" min="0" max="100" step="1" value="0">
+<input type="number" id="chgCurA" min="0" max="150" step="1" value="0">
 <label>Full charge voltage (V)</label>
-<div class="desc">Напруга, при якій акумулятор вважається повністю зарядженим. Якщо напруга акумулятора вища за це значення, система перестає резервувати потужність на зарядку і вся вільна енергія йде на ваш прилад. Це запобігає перезаряду акумулятора. Встановлюйте відповідно до типу акумулятора: для LiFePO4 12В ~14.2-14.6 В, для AGM ~14.4-14.8 В, для GEL ~14.1-14.4 В. Працює в парі з параметром «Струм зарядки». Якщо встановлено 0, функція не діє.</div>
-<input type="number" id="fullChgV" min="20" max="30" step="0.1" value="0">
+<div class="desc">Напруга, при якій акумулятор вважається повністю зарядженим. Якщо напруга акумулятора вища за це значення, система перестає резервувати потужність на зарядку і вся вільна енергія йде на ваш прилад. Це запобігає перезаряду акумулятора. Встановлюйте відповідно до типу акумулятора. Працює в парі з параметром «Струм зарядки». Якщо встановлено 0, функція не діє.</div>
+<input type="number" id="fullChgV" min="20" max="80" step="0.1" value="0">
 </div>
 <div style="text-align:center;margin-top:15px">
 <button class="btn" onclick="save()">Save</button>
@@ -733,28 +772,15 @@ void setupWebServer() {
   server.on("/api", HTTP_GET, [](AsyncWebServerRequest *r) {
     bool locked = dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE;
 
-    float api_pvV = (inv.pv[4] != 65535) ? inv.pv[4] / 10.0f : 0.0f;
-    float api_pvI = (inv.pv[6] != 65535) ? inv.pv[6] / 10.0f : 0.0f;
-    float api_invV = (inv.inv[5] != 65535) ? inv.inv[5] / 10.0f : 0.0f;
-    float api_invI = (inv.inv[11] != 65535) ? inv.inv[11] / 10.0f : 0.0f;
-
-    int32_t api_pvPower = (int32_t)round((inv.pv[7] != 65535) ? (float)inv.pv[7] : 0.0f);
-    int32_t api_invPower = (int32_t)round((inv.inv[18] != 65535) ? (float)inv.inv[18] : 0.0f);
-
-    int heaterPercent = (cfgHeaterPowerVA > 0) ? (PpowerHeater * 100 / cfgHeaterPowerVA) : 0;
-    if (heaterPercent > 100) heaterPercent = 100;
-    if (heaterPercent < 0) heaterPercent = 0;
-
     auto* res = r->beginResponseStream("application/json; charset=utf-8");
 
     res->printf(
-      "{\"ws\":%d,\"mt\":\"%s\",\"mp\":\"%s\",\"fp\":%d,\"cp\":%d,\"pph\":%d,\"hpct\":%d,\"hva\":%u,\"maVA\":%u,\"sw\":%d,\"tm\":\"%s\",",
+      "{\"ws\":%d,\"mt\":\"%s\",\"mp\":\"%s\",\"fp\":%d,\"cp\":%d,\"hpct\":%d,\"hva\":%u,\"maVA\":%u,\"sw\":%d,\"tm\":\"%s\",",
       inv.workState,
       inv.machineType.c_str(),
       inv.machinePower.c_str(),
       (int)freePower,
       (int)currentPower,
-      (int)PpowerHeater,
       heaterPercent,
       (unsigned)cfgHeaterPowerVA,
       (unsigned)cfgMaxAllocatedVA,
@@ -762,13 +788,13 @@ void setupWebServer() {
       targMessageGlobal
     );
 
-    res->printf("\"pvV\":%.1f,\"pvI\":%.1f,\"pvPower\":%d,", api_pvV, api_pvI, (int)api_pvPower);
-    res->printf("\"invV\":%.1f,\"invI\":%.1f,\"invPower\":%d,", api_invV, api_invI, (int)api_invPower);
+    res->printf("\"pvV\":%.1f,\"pvI\":%.1f,\"pvPower\":%d,", pvV, pvI, (int)pvPower);
+    res->printf("\"invV\":%.1f,\"invI\":%.1f,\"invPower\":%d,", invV, invI, (int)invPower);
     res->printf("\"battV\":%.1f,\"battI\":%.1f,\"battPower\":%.1f,", battV, battI, battPower);
-    res->printf("\"pvEnergyHi\":%u,\"pvEnergyLo\":%u,", (unsigned)inv.pv[16], (unsigned)inv.pv[17]);
-    res->printf("\"acDisHi\":%u,\"acDisLo\":%u,", (unsigned)inv.inv[52], (unsigned)inv.inv[53]);
-    res->printf("\"acChgHi\":%u,\"acChgLo\":%u,", (unsigned)inv.inv[54], (unsigned)inv.inv[55]);
-    res->printf("\"pvWork\":%u,\"mppt\":%u,\"chg\":%u}", (unsigned)inv.pv[0], (unsigned)inv.pv[1], (unsigned)inv.pv[2]);
+    res->printf("\"pvEnergyHi\":%u,\"pvEnergyLo\":%u,", pvEnergyHi, pvEnergyLo);
+    res->printf("\"acDisHi\":%u,\"acDisLo\":%u,", acDisHi, acDisLo);
+    res->printf("\"acChgHi\":%u,\"acChgLo\":%u,", acChgHi, acChgLo);
+    res->printf("\"pvWork\":%u,\"mppt\":%u,\"chg\":%u}", (unsigned)pvWork, (unsigned)mppt, (unsigned)chg);
 
     r->send(res);
     if (locked) xSemaphoreGive(dataMutex);
@@ -790,7 +816,8 @@ void setupWebServer() {
   });
 
   server.on("/api_serial", HTTP_GET, [](AsyncWebServerRequest *r) {
-    char tmp[SERIAL_BUF_SIZE];
+    char* tmp = (char*)malloc(SERIAL_BUF_SIZE);
+    if (!tmp) { r->send(500, "text/plain", "OOM"); return; }
     portENTER_CRITICAL(&serialMux);
     uint16_t h = serialHead, t = serialTail;
     portEXIT_CRITICAL(&serialMux);
@@ -801,6 +828,7 @@ void setupWebServer() {
     }
     tmp[len] = '\0';
     r->send(200, "text/plain; charset=utf-8", tmp);
+    free(tmp);
   });
 
   server.on("/save_settings", HTTP_POST, [](AsyncWebServerRequest *r) {
