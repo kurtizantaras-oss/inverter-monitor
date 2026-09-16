@@ -34,31 +34,15 @@ float cfgBattHysteresisV = 0.25f;
 float cfgBattOffCurrent = 0.0f;
 float cfgFullChargeCurrentA = 0.0f;
 float cfgFullChargeVoltage = 0.0f;
-
-// Глобальні змінні для зберігання стану та відображення
 float battV = 0.0f;
+
 int32_t freePower = 0;
 int32_t currentPower = 0;
 int32_t pvPower = 0;
 int32_t invPower = 0;
+int32_t PpowerHeater = 0;
 float battI = 0.0f;
 float battPower = 0.0f;
-
-float pvV = 0.0f;
-float pvI = 0.0f;
-float invV = 0.0f;
-float invI = 0.0f;
-
-uint16_t pvWork = 0;
-uint16_t mppt = 0;
-uint16_t chg = 0;
-
-uint32_t pvEnergyHi = 0;
-uint32_t pvEnergyLo = 0;
-uint32_t acDisHi = 0;
-uint32_t acDisLo = 0;
-uint32_t acChgHi = 0;
-uint32_t acChgLo = 0;
 
 bool switch_state = false;
 
@@ -69,8 +53,6 @@ static volatile uint16_t serialHead = 0;
 static volatile uint16_t serialTail = 0;
 static portMUX_TYPE serialMux = portMUX_INITIALIZER_UNLOCKED;
 
-int heaterPercent = 0;
-  
 void serialLog(const char* msg) {
   size_t len = strlen(msg);
   portENTER_CRITICAL(&serialMux);
@@ -124,6 +106,7 @@ void preTrans() {
   digitalWrite(RS485_CTRL, HIGH);
   delayMicroseconds(100);
 }
+
 void postTrans() {
   delayMicroseconds(100);
   Serial1.flush();
@@ -180,14 +163,21 @@ void saveSettings() {
 void pollModbusOnce() {
   bool ok = true;
   digitalWrite(LED_PIN, HIGH);
-  if (!readModbusBlock(25201, 80, invBuf)) ok = false; delay(40);
-  if (!readModbusBlock(15201, 20, pvBuf)) ok = false; delay(40);
-  if (!ok) { digitalWrite(LED_PIN, LOW); return; }
+
+  if (!readModbusBlock(25201, 80, invBuf)) ok = false;
+  delay(40);
+  if (!readModbusBlock(15201, 20, pvBuf)) ok = false;
+  delay(40);
+
+  if (!ok) return;
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
+
   memcpy(inv.inv, invBuf, sizeof(inv.inv));
   memcpy(inv.pv, pvBuf, sizeof(inv.pv));
+
   inv.workState = inv.inv[0];
+
   switch (inv.workState) {
     case 0: inv.stateStr = "POWER ON"; break;
     case 1: inv.stateStr = "SELFTEST"; break;
@@ -199,11 +189,10 @@ void pollModbusOnce() {
     default: inv.stateStr = "UNKNOWN"; break;
   }
 
-  // Оновлення глобальних змінних для відображення (з масивів Modbus)
-  pvV   = (inv.pv[4] != 65535) ? inv.pv[4] / 10.0f : 0.0f;
-  pvI   = (inv.pv[6] != 65535) ? inv.pv[6] / 10.0f : 0.0f;
-  invV  = (inv.inv[5] != 65535) ? inv.inv[5] / 10.0f : 0.0f;
-  invI  = (inv.inv[11] != 65535) ? inv.inv[11] / 10.0f : 0.0f;
+  float pvV   = (inv.pv[4] != 65535) ? inv.pv[4] / 10.0f : 0.0f;
+  float pvI   = (inv.pv[6] != 65535) ? inv.pv[6] / 10.0f : 0.0f;
+  float invV  = (inv.inv[5] != 65535) ? inv.inv[5] / 10.0f : 0.0f;
+  float invI  = (inv.inv[11] != 65535) ? inv.inv[11] / 10.0f : 0.0f;
 
   if (inv.inv[4] != 0 && inv.inv[4] != 65535) {
     battV = inv.inv[4] / 10.0f;
@@ -221,8 +210,9 @@ void pollModbusOnce() {
   if (battV < cfgFullChargeVoltage || pvI < cfgFullChargeCurrentA) {
     freePower -= (int32_t)(pvV * cfgFullChargeCurrentA);
   }
-  
+
   static bool isBattLow = false;
+
   if (cfgBattOffVoltage > 0.0f) {
     if (battV < cfgBattOffVoltage) isBattLow = true;
     else if (battV >= cfgBattOffVoltage + cfgBattHysteresisV) isBattLow = false;
@@ -233,16 +223,20 @@ void pollModbusOnce() {
   const char* targMessage = "Все добре";
 
   if (inv.inv[0] != 2) {
-    freePower = 0; currentPower = 0;
+    freePower = 0;
+    currentPower = 0;
     targMessage = "Інвертер споживає з розетки";
   } else if (freePower <= 0) {
-    freePower = 0; currentPower = 0;
+    freePower = 0;
+    currentPower = 0;
     targMessage = "Вільна потужність відсутня";
   } else if (isBattLow) {
-    freePower = 0; currentPower = 0;
+    freePower = 0;
+    currentPower = 0;
     targMessage = "Напруга акамулятора менше встановленого мінімуму";
   } else if (pvI < cfgBattOffCurrent) {
-    freePower = 0; currentPower = 0;
+    freePower = 0;
+    currentPower = 0;
     targMessage = "Струм акамулятора менше встановленого мінімуму";
   } else {
     if (freePower < 0) {
@@ -259,38 +253,21 @@ void pollModbusOnce() {
         targMessage = "Потужність збільшено";
       }
     }
+
     if (currentPower >= cfgMaxAllocatedVA) {
       currentPower = cfgMaxAllocatedVA;
       targMessage = "Потужність обрізано до максимуму.";
     }
   }
 
-  // Розрахунок відсотка для пакетного керування (Burst Control)
-  if (cfgHeaterPowerVA > 0 && switch_state) {
-    heaterPercent = (currentPower * 100) / cfgHeaterPowerVA;
-    if (heaterPercent > 100) heaterPercent = 100;
-    if (heaterPercent < 0) heaterPercent = 0;
-  } else {
-    heaterPercent = 0;
-  }
-
-  // Оновлення змінних лічильників та станів
-  pvEnergyHi = inv.pv[16];
-  pvEnergyLo = inv.pv[17];
-  acDisHi = inv.inv[52];
-  acDisLo = inv.inv[53];
-  acChgHi = inv.inv[54];
-  acChgLo = inv.inv[55];
-  pvWork = inv.pv[0];
-  mppt = inv.pv[1];
-  chg = inv.pv[2];
+  PpowerHeater = currentPower;
 
   strncpy(targMessageGlobal, targMessage, sizeof(targMessageGlobal) - 1);
   targMessageGlobal[sizeof(targMessageGlobal) - 1] = '\0';
 
   char logLine[256];
-  snprintf(logLine, sizeof(logLine), "[%lu] ws=%d pvV=%.1f pvI=%.1f invV=%.0f invI=%.1f battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d sw=%d msg=%s\n",
-           millis(), inv.workState, pvV, pvI, invV, invI, battV, battI, battPower, pvPower, invPower, freePower, currentPower, switch_state ? 1 : 0, targMessage);
+  snprintf(logLine, sizeof(logLine), "[%lu] ws=%d pvV=%.1f pvI=%.1f invV=%.0f invI=%.1f battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d pph=%d sw=%d msg=%s\n",
+           millis(), inv.workState, pvV, pvI, invV, invI, battV, battI, battPower, pvPower, invPower, freePower, currentPower, PpowerHeater, switch_state ? 1 : 0, targMessage);
   serialLog(logLine);
 
   xSemaphoreGive(dataMutex);
@@ -330,17 +307,19 @@ body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verda
 .free-power-box{background:#161616;border-radius:6px;padding:8px;text-align:center;border:1px solid #2a2a2a}
 .free-power-box .label{color:#666;font-size:10px;margin-bottom:2px;text-transform:uppercase;letter-spacing:1px}
 .free-power-box .value{font-size:18px;font-weight:bold;color:#00ff88;font-family:monospace}
-.heater-slider-box{background:#161616;border-radius:6px;padding:6px 8px;text-align:center;border:1px solid #2a2a2a;margin-top:6px}
-.heater-slider-box .label{color:#666;font-size:10px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px}
-.slider-track{background:#2a2a2a;border-radius:6px;height:22px;width:100%;position:relative;overflow:hidden;box-shadow:inset 0 2px 4px rgba(0,0,0,0.4)}
-.slider-fill{height:100%;border-radius:6px;transition:width 0.4s ease,background 0.4s ease;width:0%;box-shadow:0 0 8px rgba(0,255,136,0.15)}
-.slider-text{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:11px;font-weight:bold;font-family:monospace;text-shadow:0 1px 3px rgba(0,0,0,0.9);z-index:2;pointer-events:none;letter-spacing:0.5px}
-.switch-row{display:flex;align-items:stretch;justify-content:center;gap:10px;margin-top:6px;padding:8px 12px;background:#161616;border-radius:6px;border:1px solid #2a2a2a;min-height:56px}
-.switch-btn{background:none;border:none;cursor:pointer;padding:6px 20px;display:flex;align-items:center;justify-content:center;gap:8px;transition:transform 0.15s,background 0.15s;align-self:stretch;border-radius:6px;min-width:90px}
-.switch-btn:hover{transform:scale(1.04);background:rgba(255,255,255,0.05)}
-.switch-btn:active{transform:scale(0.96)}
-.switch-btn svg{width:auto;height:100%;min-width:36px;max-width:52px;transition:fill 0.3s}
-.switch-label{color:#888;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:0.5px;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.3;text-align:center}
+.heater-slider-box{background:#161616;border-radius:6px;padding:8px;text-align:center;border:1px solid #2a2a2a;margin-top:6px}
+.heater-slider-box .label{color:#666;font-size:10px;margin-bottom:2px;text-transform:uppercase;letter-spacing:1px}
+.slider-track{background:#333;border-radius:4px;height:12px;width:100%;margin-top:4px;overflow:hidden;position:relative}
+.slider-fill{height:100%;border-radius:4px;transition:width 0.4s ease, background-color 0.4s ease;width:0%}
+.slider-text{color:#888;font-size:10px;margin-top:4px;font-family:monospace}
+
+.switch-row{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:6px;padding:10px 14px;background:#161616;border-radius:6px;border:1px solid #2a2a2a}
+.toggle-switch{position:relative;width:96px;height:56px;background-color:#333;border-radius:28px;cursor:pointer;transition:background-color .3s,border-color .3s;border:2px solid #444;flex-shrink:0;box-sizing:border-box}
+.toggle-switch.active{background-color:rgba(0,255,136,.15);border-color:#00ff88}
+.toggle-knob{position:absolute;top:4px;left:4px;width:44px;height:44px;background-color:#888;border-radius:50%;transition:transform .3s cubic-bezier(.4,0,.2,1),background-color .3s;box-shadow:0 2px 5px rgba(0,0,0,.4)}
+.toggle-switch.active .toggle-knob{transform:translateX(40px);background-color:#00ff88}
+.switch-label{color:#888;font-size:12px;font-weight:bold;text-transform:uppercase;letter-spacing:.5px}
+
 .controls{margin-top:15px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:960px}
 .btn{background:#333;color:#fff;border:1px solid #444;padding:7px 12px;border-radius:5px;cursor:pointer;font-size:11px;font-family:inherit;transition:background .2s}
 .btn:hover{background:#444}
@@ -391,29 +370,32 @@ body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verda
         <div class="label">CURRENT HEATER POWER</div>
         <div class="value" id="curP">0 VA</div>
       </div>
+
       <div class="heater-slider-box">
         <div class="label">HEATER LOAD</div>
         <div class="slider-track">
-          <div id="hSlider" class="slider-fill" style="width:0%;background:#00ff88"></div>
-          <span id="hSliderText" class="slider-text">0%</span>
+          <div id="hSlider" class="slider-fill" style="width: 0%; background: #00ff88;"></div>
         </div>
+        <div id="hSliderText" class="slider-text">0%</div>
       </div>
+
       <div class="switch-row">
-        <span class="switch-label">НАВАНТАЖЕННЯ</span>
-        <button class="switch-btn" id="switchBtn" onclick="toggleSwitch()">
-          <svg id="switchIcon" viewBox="0 0 24 24" fill="#555">
-            <path id="switchPath" d="M7 7h10c2.76 0 5 2.24 5 5s-2.24 5-5 5H7c-2.76 0-5-2.24-5-5s2.24-5 5-5zm0 8c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3z"/>
-          </svg>
-        </button>
-        <span class="switch-label" id="switchStatus" style="color:#888">OFF</span>
+        <span class="switch-label">СПОЖИВАННЯ</span>
+        <div class="toggle-switch" id="switchBtn" onclick="toggleSwitch()">
+          <div class="toggle-knob"></div>
+        </div>
+        <span class="switch-label" id="switchStatus" style="color:#888">ВИМК</span>
       </div>
+
       <div class="status-text">
         <span class="machine" id="machineInfo">--</span><br>
         <span class="state" id="stateInfo">--</span>
       </div>
+
       <div class="alert-box" id="alertBox">
         <div class="value" id="targMsg">--</div>
       </div>
+
       <div class="free-power-box">
         <div class="label">FREE POWER</div>
         <div class="value" id="freeP">0 VA</div>
@@ -454,6 +436,7 @@ body{background:#121212;color:#e6e6e6;font-family:'Segoe UI',Tahoma,Geneva,Verda
 <div class="controls">
 <button class="btn primary" onclick="update()">Refresh</button>
 <button class="btn" onclick="location.href='/settings'">Settings</button>
+<button class="btn" id="signalBtn" onclick="location.href='/signal'">Сигнал</button>
 <button class="btn warn" onclick="resetCounters()">Reset counters</button>
 <button class="btn" onclick="resetWifi()">Reset WiFi</button>
 <button class="btn danger" onclick="restartEsp()">Restart ESP</button>
@@ -478,9 +461,11 @@ function fmt1(v,unit){if(isBad(v))return"--";return Number(v).toFixed(1)+(unit?"
 function fmt0(v,unit){if(isBad(v))return"--";return Math.round(Number(v))+(unit?" "+unit:"")}
 function fmtKwh(hi,lo){if(isBad(hi)||isBad(lo))return"--";return(hi*1000+lo/10).toFixed(1)+" kWh"}
 function toggleUpdate(){document.getElementById("updateSection").classList.toggle("active")}
+
 async function resetWifi(){if(confirm("Reset WiFi?")){await fetch("/reset_wifi");location.reload()}}
 async function resetCounters(){if(!confirm("Reset all counters?"))return;await fetch("/reset_counters");alert("Done")}
 async function restartEsp(){if(!confirm("Restart ESP32?"))return;await fetch("/restart");alert("Restarting...");setTimeout(()=>location.reload(),5000)}
+
 function doUpdate(){
 let f=document.getElementById("fwfile").files[0];
 if(!f){alert("Select .bin file");return}
@@ -504,18 +489,15 @@ updateSwitchUI(data.state);
 }catch(e){alert("Connection error!")}}
 
 function updateSwitchUI(state){
-let icon=document.getElementById("switchIcon");
-let path=document.getElementById("switchPath");
+let switchEl=document.getElementById("switchBtn");
 let status=document.getElementById("switchStatus");
 if(state){
-icon.setAttribute("fill","#00ff88");
-path.setAttribute("d","M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z");
-status.innerText="ON";
+switchEl.classList.add("active");
+status.innerText="УВІМК";
 status.style.color="#00ff88";
 }else{
-icon.setAttribute("fill","#555");
-path.setAttribute("d","M7 7h10c2.76 0 5 2.24 5 5s-2.24 5-5 5H7c-2.76 0-5-2.24-5-5s2.24-5 5-5zm0 8c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3z");
-status.innerText="OFF";
+switchEl.classList.remove("active");
+status.innerText="ВИМК";
 status.style.color="#888";
 }}
 
@@ -565,10 +547,14 @@ let hpct = d.hpct || 0;
 let hSlider = document.getElementById("hSlider");
 hSlider.style.width = hpct + "%";
 let hColor = hpct < 33 ? "#00ff88" : (hpct < 66 ? "#ffd166" : "#ff4d4d");
-hSlider.style.background = "linear-gradient(90deg," + hColor + "88," + hColor + ")";
+hSlider.style.background = hColor;
 document.getElementById("hSliderText").innerText = hpct + "%";
+document.getElementById("hSliderText").style.color = hColor;
 
 updateSwitchUI(d.sw);
+
+let sigBtn=document.getElementById("signalBtn");
+if(sigBtn){sigBtn.innerText="Сигнал: "+((d.rssi!=null&&d.rssi!==0)?d.rssi+" dBm":"--");}
 
 let tm=d.tm||"--";
 let tmEl=document.getElementById("targMsg");
@@ -643,34 +629,34 @@ input{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;background:#333
 <div class="card">
 <label>Heater power (VA)</label>
 <div class="desc">Номінальна потужність вашого приладу (навантаження), наприклад ТЭНа, у вольт-амперах (ВА). Це базове значення, яке використовується системою для розрахунку допустимої потужності. Вказуйте потужність приладу, яка зазначена на шильдику або в паспорті. Якщо встановлено 0, система не використовує це обмеження.</div>
-<input type="number" id="heaterVA" min="0" max="15000" value="0">
+<input type="number" id="heaterVA" min="0" max="99999" value="0">
 <label>Max allocated power (VA)</label>
 <div class="desc">Максимальна потужність у ВА, яку система може виділити на ваш прилад. Це жорстке обмеження, яке запобігає перевантаженню інвертора або проводки. Навіть якщо вільна потужність від сонячних панелей вища, потужність приладу не перевищить це значення. Рекомендується встановлювати не більше номінальної потужності інвертора та потужності приладу. Якщо встановлено 0, обмеження не діє.</div>
-<input type="number" id="maxAllocVA" min="0" max="15000" value="0">
+<input type="number" id="maxAllocVA" min="0" max="99999" value="0">
 <label>Update interval (sec)</label>
 <div class="desc">Інтервал опитування інвертора по Modbus у секундах. Визначає, як часто система зчитує дані про напругу, струм та потужність. Занадто малий інтервал (менше 1 сек) може перевантажити інтерфейс або інвертор, занадто великий призведе до запізнень у реакції на зміни. Рекомендований діапазон: 1-3 сек. За замовчуванням 2 сек.</div>
-<input type="number" id="updIntSec" min="0.5" max="10" step="0.1" value="2">
+<input type="number" id="updIntSec" min="0.5" max="10" step="0.5" value="2">
 </div>
 <h2>Load shutdown</h2>
 <div class="card">
 <label>Shutdown voltage (V)</label>
-<div class="desc">Критична напруга акумулятора, при якій навантаження примусово вимикається для захисту акумулятора від глибокого розряду. Вимірюється на клемах акумулятора. Рекомендується встановлювати на рівні напруги, нижче якої розряд акумулятора стає небезпечним. Також враховуйте налаштування інвертора (зазвичай Floating voltage +0.2-0.5 В). Якщо встановлено 0, захист по напрузі вимкнено.</div>
-<input type="number" id="battOffV" min="0" max="80" step="0.1" value="0">
+<div class="desc">Критична напруга акумулятора, при якій навантаження примусово вимикається для захисту акумулятора від глибокого розряду. Вимірюється на клемах акумулятора. Рекомендується встановлювати на рівні напруги, нижче якої розряд акумулятора стає небезпечним. Наприклад, для LiFePO4 12В це ~11.5-12.0В, для AGM/GEL ~11.8-12.2В. Також враховуйте налаштування інвертора (зазвичай Floating voltage +0.2-0.5 В). Якщо встановлено 0, захист по напрузі вимкнено.</div>
+<input type="number" id="battOffV" min="0" max="99.9" step="0.1" value="0">
 <label>Hysteresis (V)</label>
 <div class="desc">Гістерезис напруги (В). Різниця між напругою відключення і напругою повторного включення навантаження. Запобігає частому перемиканню (дребезгу) реле при коливаннях напруги. Наприклад, якщо встановлено 22.0 В і гістерезис 0.3 В, прилад вимкнеться при 22.0 В, а увімкнеться назад тільки коли напруга підніметься до 22.3 В. Рекомендовано 0.2 - 0.5 В. Якщо встановлено 0, гістерезис відсутній (може призвести до частих перемикань).</div>
-<input type="number" id="battHystV" min="0" max="5" step="0.05" value="0.25">
+<input type="number" id="battHystV" min="0" max="5" step="0.1" value="0.25">
 <label>Shutdown current (A)</label>
 <div class="desc">Мінімальний струм акумулятора, при якому дозволяється робота навантаження. Якщо струм акумулятора нижчий за це значення (наприклад, сонячні панелі не дають достатньо енергії або акумулятор розряджений), прилад вимикається. Може використовуватися для захисту від роботи при дуже низькому зарядному струмі. Якщо встановлено 0, захист по струму вимкнено.</div>
-<input type="number" id="battOffI" min="0" max="150" step="1" value="0">
+<input type="number" id="battOffI" min="0" max="999.9" step="0.1" value="0">
 </div>
 <h2>Battery charging</h2>
 <div class="card">
 <label>Charge current (A)</label>
 <div class="desc">Струм, який резервується для зарядки акумулятора під час роботи приладу. Система віднімає цю потужність (напруга акумулятора × зарядний струм) від вільної потужності сонячних панелей, щоб акумулятор отримував заряд. Наприклад, якщо вільна потужність 500 ВА, а зарядний струм 10 А при напрузі 24 В, на прилад піде лише 500 - 240 = 260 ВА. Якщо встановлено 0, вся вільна потужність іде на прилад, акумулятор не заряджається.</div>
-<input type="number" id="chgCurA" min="0" max="150" step="1" value="0">
+<input type="number" id="chgCurA" min="0" max="100" step="1" value="0">
 <label>Full charge voltage (V)</label>
-<div class="desc">Напруга, при якій акумулятор вважається повністю зарядженим. Якщо напруга акумулятора вища за це значення, система перестає резервувати потужність на зарядку і вся вільна енергія йде на ваш прилад. Це запобігає перезаряду акумулятора. Встановлюйте відповідно до типу акумулятора. Працює в парі з параметром «Струм зарядки». Якщо встановлено 0, функція не діє.</div>
-<input type="number" id="fullChgV" min="20" max="80" step="0.1" value="0">
+<div class="desc">Напруга, при якій акумулятор вважається повністю зарядженим. Якщо напруга акумулятора вища за це значення, система перестає резервувати потужність на зарядку і вся вільна енергія йде на ваш прилад. Це запобігає перезаряду акумулятора. Встановлюйте відповідно до типу акумулятора: для LiFePO4 12В ~14.2-14.6 В, для AGM ~14.4-14.8 В, для GEL ~14.1-14.4 В. Працює в парі з параметром «Струм зарядки». Якщо встановлено 0, функція не діє.</div>
+<input type="number" id="fullChgV" min="20" max="30" step="0.1" value="0">
 </div>
 <div style="text-align:center;margin-top:15px">
 <button class="btn" onclick="save()">Save</button>
@@ -719,20 +705,90 @@ if(!n.length){s.innerHTML="<option value=''>No networks</option>";return}
 n.forEach(x=>{let o=document.createElement("option");o.value=x.ssid;o.text=x.ssid+" ("+x.rssi+")";s.appendChild(o)})})</script></body></html>
 )rawliteral";
 
-void triggerReboot() { needRestart = true; restartRequestedMs = millis(); }
+const char SIGNAL_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Рівень сигналу</title>
+<style>
+body{background:#0f0f0f;color:#e6e6e6;font-family:monospace;padding:15px;margin:0}
+h1{color:#00ff88;text-align:center;font-size:18px}
+.card{background:#1c1c1c;border-radius:10px;padding:20px;max-width:420px;margin:12px auto}
+.big{text-align:center;font-size:36px;font-weight:bold;margin:8px 0}
+.small{text-align:center;color:#888;font-size:12px;margin-bottom:14px}
+.bar{height:14px;background:#333;border-radius:7px;overflow:hidden;margin:10px 0 18px}
+.fill{height:100%;width:0;background:#00ff88;transition:width .4s,background .4s}
+.row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #2a2a2a;font-size:12px}
+.row:last-child{border-bottom:none}
+.k{color:#888}
+.v{font-weight:bold;text-align:right;word-break:break-all}
+.btn{background:#00ff88;color:#000;border:none;padding:10px 18px;border-radius:6px;cursor:pointer;font-weight:bold;margin:5px}
+.bg{background:#555;color:#fff}
+.center{text-align:center;margin-top:14px}
+</style></head><body>
+<h1>Рівень сигналу</h1>
+<div class="card">
+<div class="big" id="q">--</div>
+<div class="small" id="rssi">--</div>
+<div class="bar"><div class="fill" id="fill"></div></div>
+<div class="row"><span class="k">Статус</span><span class="v" id="status">--</span></div>
+<div class="row"><span class="k">Мережа</span><span class="v" id="ssid">--</span></div>
+<div class="row"><span class="k">IP</span><span class="v" id="ip">--</span></div>
+<div class="row"><span class="k">MAC</span><span class="v" id="mac">--</span></div>
+</div>
+<div class="center">
+<button class="btn bg" onclick="location.href='/'">Назад</button>
+</div>
+<script>
+function esc(s){return String(s||'--').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+async function upd(){
+try{
+let d=await(await fetch('/api_signal')).json();
+let q=d.quality||0;
+document.getElementById('q').innerText=q+'%';
+document.getElementById('rssi').innerText='RSSI: '+((d.rssi!=null&&d.rssi!==0)?d.rssi+' dBm':'--');
+let fill=document.getElementById('fill');
+fill.style.width=q+'%';
+fill.style.background=q>70?'#00ff88':(q>40?'#ffd166':'#ff4d4d');
+let st='--';
+if(d.status==='CONNECTED') st='Підключено';
+else if(d.status==='DISCONNECTED') st='Не підключено';
+document.getElementById('status').innerText=st;
+document.getElementById('ssid').innerText=esc(d.ssid);
+document.getElementById('ip').innerText=esc(d.ip);
+document.getElementById('mac').innerText=esc(d.mac);
+}catch(e){document.getElementById('q').innerText='Помилка'}
+}
+upd();setInterval(upd,2000);
+</script></body></html>
+)rawliteral";
+
+void triggerReboot() {
+  needRestart = true;
+  restartRequestedMs = millis();
+}
 
 void startSetupAP() {
   setupMode = true;
-  WiFi.mode(WIFI_AP); WiFi.softAP("Inverter-Setup");
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("Inverter-Setup");
   dnsServer.start(53, "*", WiFi.softAPIP());
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) { r->send_P(200, "text/html", SETUP_HTML); });
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
+    r->send_P(200, "text/html", SETUP_HTML);
+  });
+
   server.on("/scan_wifi", HTTP_GET, [](AsyncWebServerRequest* r) {
     int n = WiFi.scanNetworks();
     auto* res = r->beginResponseStream("application/json");
     res->print("[");
-    for (int i = 0; i < n; i++) { if (i) res->print(","); res->printf("{\"ssid\":\"%s\",\"rssi\":%d}", WiFi.SSID(i).c_str(), WiFi.RSSI(i)); }
-    res->print("]"); WiFi.scanDelete(); r->send(res);
+    for (int i = 0; i < n; i++) {
+      if (i) res->print(",");
+      res->printf("{\"ssid\":\"%s\",\"rssi\":%d}", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+    }
+    res->print("]");
+    WiFi.scanDelete();
+    r->send(res);
   });
+
   server.on("/save_wifi", HTTP_POST, [](AsyncWebServerRequest* r) {
     if (r->hasParam("ssid", true) && r->hasParam("password", true)) {
       preferences.begin("wifi_config", false);
@@ -741,9 +797,15 @@ void startSetupAP() {
       preferences.end();
       r->send(200, "text/html", "<h3 style='color:white;text-align:center'>Saved! Rebooting...</h3>");
       triggerReboot();
-    } else r->send(400, "text/plain", "Bad Request");
+    } else {
+      r->send(400, "text/plain", "Bad Request");
+    }
   });
-  server.onNotFound([](AsyncWebServerRequest* r) { r->send_P(200, "text/html", SETUP_HTML); });
+
+  server.onNotFound([](AsyncWebServerRequest* r) {
+    r->send_P(200, "text/html", SETUP_HTML);
+  });
+
   server.begin();
 }
 
@@ -754,33 +816,65 @@ void onUpdateUpload(AsyncWebServerRequest* request, String filename, size_t inde
       Update.abort();
       return;
     }
-    webUpdateActive = true; 
-    if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) Update.printError(Serial); 
+    webUpdateActive = true;
+    if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) Update.printError(Serial);
   }
+
   if (!Update.hasError() && Update.write(data, len) != len) Update.printError(Serial);
-  if (final) { 
-    if (Update.end(true)) Serial.printf("Update OK: %u bytes\n", (unsigned)(index + len)); 
-    else { Update.printError(Serial); webUpdateActive = false; } 
+
+  if (final) {
+    if (Update.end(true)) Serial.printf("Update OK: %u bytes\n", (unsigned)(index + len));
+    else {
+      Update.printError(Serial);
+      webUpdateActive = false;
+    }
   }
 }
 
+int wifiQualityPercent(int rssi) {
+  if (rssi == 0) return 0;
+  if (rssi >= -50) return 100;
+  if (rssi <= -90) return 0;
+  return (int)((rssi + 90) * 2.5f);
+}
+
+String safeJsonString(String s) {
+  s.replace('"', '_');
+  s.replace('\n', ' ');
+  s.replace('\r', ' ');
+  return s;
+}
+
 void setupWebServer() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) { 
-    r->send_P(200, "text/html", INDEX_HTML); 
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send_P(200, "text/html", INDEX_HTML);
   });
 
   server.on("/api", HTTP_GET, [](AsyncWebServerRequest *r) {
     bool locked = dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE;
 
+    float api_pvV = (inv.pv[4] != 65535) ? inv.pv[4] / 10.0f : 0.0f;
+    float api_pvI = (inv.pv[6] != 65535) ? inv.pv[6] / 10.0f : 0.0f;
+    float api_invV = (inv.inv[5] != 65535) ? inv.inv[5] / 10.0f : 0.0f;
+    float api_invI = (inv.inv[11] != 65535) ? inv.inv[11] / 10.0f : 0.0f;
+
+    int32_t api_pvPower = (int32_t)round((inv.pv[7] != 65535) ? (float)inv.pv[7] : 0.0f);
+    int32_t api_invPower = (int32_t)round((inv.inv[18] != 65535) ? (float)inv.inv[18] : 0.0f);
+
+    int heaterPercent = (cfgHeaterPowerVA > 0) ? (PpowerHeater * 100 / cfgHeaterPowerVA) : 0;
+    if (heaterPercent > 100) heaterPercent = 100;
+    if (heaterPercent < 0) heaterPercent = 0;
+
     auto* res = r->beginResponseStream("application/json; charset=utf-8");
 
     res->printf(
-      "{\"ws\":%d,\"mt\":\"%s\",\"mp\":\"%s\",\"fp\":%d,\"cp\":%d,\"hpct\":%d,\"hva\":%u,\"maVA\":%u,\"sw\":%d,\"tm\":\"%s\",",
+      "{\"ws\":%d,\"mt\":\"%s\",\"mp\":\"%s\",\"fp\":%d,\"cp\":%d,\"pph\":%d,\"hpct\":%d,\"hva\":%u,\"maVA\":%u,\"sw\":%d,\"tm\":\"%s\",",
       inv.workState,
       inv.machineType.c_str(),
       inv.machinePower.c_str(),
       (int)freePower,
       (int)currentPower,
+      (int)PpowerHeater,
       heaterPercent,
       (unsigned)cfgHeaterPowerVA,
       (unsigned)cfgMaxAllocatedVA,
@@ -788,20 +882,25 @@ void setupWebServer() {
       targMessageGlobal
     );
 
-    res->printf("\"pvV\":%.1f,\"pvI\":%.1f,\"pvPower\":%d,", pvV, pvI, (int)pvPower);
-    res->printf("\"invV\":%.1f,\"invI\":%.1f,\"invPower\":%d,", invV, invI, (int)invPower);
+    res->printf("\"pvV\":%.1f,\"pvI\":%.1f,\"pvPower\":%d,", api_pvV, api_pvI, (int)api_pvPower);
+    res->printf("\"invV\":%.1f,\"invI\":%.1f,\"invPower\":%d,", api_invV, api_invI, (int)api_invPower);
     res->printf("\"battV\":%.1f,\"battI\":%.1f,\"battPower\":%.1f,", battV, battI, battPower);
-    res->printf("\"pvEnergyHi\":%u,\"pvEnergyLo\":%u,", pvEnergyHi, pvEnergyLo);
-    res->printf("\"acDisHi\":%u,\"acDisLo\":%u,", acDisHi, acDisLo);
-    res->printf("\"acChgHi\":%u,\"acChgLo\":%u,", acChgHi, acChgLo);
-    res->printf("\"pvWork\":%u,\"mppt\":%u,\"chg\":%u}", (unsigned)pvWork, (unsigned)mppt, (unsigned)chg);
+    res->printf("\"pvEnergyHi\":%u,\"pvEnergyLo\":%u,", (unsigned)inv.pv[16], (unsigned)inv.pv[17]);
+    res->printf("\"acDisHi\":%u,\"acDisLo\":%u,", (unsigned)inv.inv[52], (unsigned)inv.inv[53]);
+    res->printf("\"acChgHi\":%u,\"acChgLo\":%u,", (unsigned)inv.inv[54], (unsigned)inv.inv[55]);
+    res->printf("\"pvWork\":%u,\"mppt\":%u,\"chg\":%u,\"rssi\":%d}",
+                (unsigned)inv.pv[0],
+                (unsigned)inv.pv[1],
+                (unsigned)inv.pv[2],
+                WiFi.RSSI());
 
     r->send(res);
+
     if (locked) xSemaphoreGive(dataMutex);
   });
 
-  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *r) { 
-    r->send_P(200, "text/html", SETTINGS_HTML); 
+  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send_P(200, "text/html", SETTINGS_HTML);
   });
 
   server.on("/api_settings", HTTP_GET, [](AsyncWebServerRequest *r) {
@@ -811,24 +910,44 @@ void setupWebServer() {
     r->send(res);
   });
 
-  server.on("/serial", HTTP_GET, [](AsyncWebServerRequest *r) { 
-    r->send_P(200, "text/html", SERIAL_HTML); 
+  server.on("/serial", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send_P(200, "text/html", SERIAL_HTML);
   });
 
   server.on("/api_serial", HTTP_GET, [](AsyncWebServerRequest *r) {
-    char* tmp = (char*)malloc(SERIAL_BUF_SIZE);
-    if (!tmp) { r->send(500, "text/plain", "OOM"); return; }
+    char tmp[SERIAL_BUF_SIZE];
+
     portENTER_CRITICAL(&serialMux);
     uint16_t h = serialHead, t = serialTail;
     portEXIT_CRITICAL(&serialMux);
+
     uint16_t len = 0;
     while (t != h && len < SERIAL_BUF_SIZE - 1) {
       tmp[len++] = serialBuf[t];
       t = (t + 1) % SERIAL_BUF_SIZE;
     }
     tmp[len] = '\0';
+
     r->send(200, "text/plain; charset=utf-8", tmp);
-    free(tmp);
+  });
+
+  server.on("/signal", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send_P(200, "text/html", SIGNAL_HTML);
+  });
+
+  server.on("/api_signal", HTTP_GET, [](AsyncWebServerRequest *r) {
+    int rssi = WiFi.RSSI();
+    int quality = wifiQualityPercent(rssi);
+    const char* status = (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
+
+    String ssid = safeJsonString(WiFi.SSID());
+    String ip = WiFi.localIP().toString();
+    String mac = safeJsonString(WiFi.macAddress());
+
+    auto* res = r->beginResponseStream("application/json; charset=utf-8");
+    res->printf("{\"rssi\":%d,\"quality\":%d,\"status\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\"}",
+                rssi, quality, status, ssid.c_str(), ip.c_str(), mac.c_str());
+    r->send(res);
   });
 
   server.on("/save_settings", HTTP_POST, [](AsyncWebServerRequest *r) {
@@ -841,7 +960,9 @@ void setupWebServer() {
       if (req->hasParam("battOffI", true)) cfgBattOffCurrent = req->getParam("battOffI", true)->value().toFloat();
       if (req->hasParam("chgCurA", true)) cfgFullChargeCurrentA = constrain(req->getParam("chgCurA", true)->value().toFloat(), 0.0f, 100.0f);
       if (req->hasParam("fullChgV", true)) cfgFullChargeVoltage = constrain(req->getParam("fullChgV", true)->value().toFloat(), 20.0f, 30.0f);
-      saveSettings(); req->send(200, "text/plain", "OK");
+
+      saveSettings();
+      req->send(200, "text/plain", "OK");
     });
   });
 
@@ -849,6 +970,7 @@ void setupWebServer() {
     requireLocalIP(r, [](AsyncWebServerRequest *req) {
       switch_state = !switch_state;
       saveSettings();
+
       auto* res = req->beginResponseStream("application/json");
       res->printf("{\"state\":%d}", switch_state ? 1 : 0);
       req->send(res);
@@ -856,72 +978,132 @@ void setupWebServer() {
   });
 
   server.on("/restart", HTTP_GET, [](AsyncWebServerRequest *r) {
-    requireLocalIP(r, [](AsyncWebServerRequest *req) { req->send(200, "text/plain", "OK"); triggerReboot(); });
-  });
-  
-  server.on("/reset_wifi", HTTP_GET, [](AsyncWebServerRequest *r) {
-    requireLocalIP(r, [](AsyncWebServerRequest *req) { 
-      preferences.begin("wifi_config", false); preferences.clear(); preferences.end(); 
-      req->send(200, "text/plain", "OK"); triggerReboot(); 
+    requireLocalIP(r, [](AsyncWebServerRequest *req) {
+      req->send(200, "text/plain", "OK");
+      triggerReboot();
     });
   });
-  
+
+  server.on("/reset_wifi", HTTP_GET, [](AsyncWebServerRequest *r) {
+    requireLocalIP(r, [](AsyncWebServerRequest *req) {
+      preferences.begin("wifi_config", false);
+      preferences.clear();
+      preferences.end();
+      req->send(200, "text/plain", "OK");
+      triggerReboot();
+    });
+  });
+
   server.on("/reset_counters", HTTP_GET, [](AsyncWebServerRequest *r) {
-    requireLocalIP(r, [](AsyncWebServerRequest *req) { pendingCounterReset = true; req->send(200, "text/plain", "OK"); });
+    requireLocalIP(r, [](AsyncWebServerRequest *req) {
+      pendingCounterReset = true;
+      req->send(200, "text/plain", "OK");
+    });
   });
 
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest *r) {
     requireLocalIP(r, [](AsyncWebServerRequest *req) {
-      if (Update.hasError()) { webUpdateActive = false; req->send(500, "text/plain", "FAIL"); }
-      else { req->send(200, "text/plain", "OK"); triggerReboot(); }
+      if (Update.hasError()) {
+        webUpdateActive = false;
+        req->send(500, "text/plain", "FAIL");
+      } else {
+        req->send(200, "text/plain", "OK");
+        triggerReboot();
+      }
     });
   }, onUpdateUpload);
 
-  server.onNotFound([](AsyncWebServerRequest *r) { 
-    r->redirect("/"); 
+  server.onNotFound([](AsyncWebServerRequest *r) {
+    r->redirect("/");
   });
-  
+
   server.begin();
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(RS485_CTRL, OUTPUT); digitalWrite(RS485_CTRL, LOW);
-  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH);
+
+  pinMode(RS485_CTRL, OUTPUT);
+  digitalWrite(RS485_CTRL, LOW);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
   WiFi.persistent(false);
+
   preferences.begin("wifi_config", true);
   wifiSsid = preferences.getString("ssid", "");
   wifiPassword = preferences.getString("password", "");
   preferences.end();
+
   loadSettings();
+
   if (wifiSsid.length()) {
-    WiFi.mode(WIFI_STA); WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+
     unsigned long t = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t < WIFI_CONNECT_TIMEOUT_MS) delay(300);
   }
-  if (WiFi.status() != WL_CONNECTED) { startSetupAP(); return; }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    startSetupAP();
+    return;
+  }
+
   MDNS.begin("inverter");
+
   Serial1.begin(19200, SERIAL_8N1, RX2_PIN, TX2_PIN);
   node.begin(SLAVE_ID, Serial1);
-  node.preTransmission(preTrans); node.postTransmission(postTrans);
+  node.preTransmission(preTrans);
+  node.postTransmission(postTrans);
+
   delay(1500);
-  uint16_t r0 = readSingleRegisterWithRetry(20000), r1 = readSingleRegisterWithRetry(20001);
+
+  uint16_t r0 = readSingleRegisterWithRetry(20000);
+  uint16_t r1 = readSingleRegisterWithRetry(20001);
+
   if (r0 != 0xFFFF && r1 != 0xFFFF) {
     inv.machineType = String((char)((r0 >> 8) & 0xFF)) + String((char)(r0 & 0xFF));
     inv.machinePower = (r1 == 1800 || r1 == 3000) ? String(r1) : "—";
-  } else { inv.machineType = "UNKNOWN"; inv.machinePower = "—"; }
+  } else {
+    inv.machineType = "UNKNOWN";
+    inv.machinePower = "—";
+  }
+
   dataMutex = xSemaphoreCreateMutex();
-  setupWebServer(); 
+
+  setupWebServer();
+
   lastUpdateMs = millis();
   serialLog("=== System started ===\n");
 }
 
 void loop() {
   unsigned long now = millis();
+
   if (needRestart && now - restartRequestedMs >= RESTART_DELAY_MS) ESP.restart();
-  if (setupMode) { dnsServer.processNextRequest(); return; }
-  if (WiFi.status() != WL_CONNECTED && now - lastWifiReconnectMs >= WIFI_RECONNECT_INTERVAL_MS) { lastWifiReconnectMs = now; WiFi.reconnect(); }
-  
-  if (pendingCounterReset) { pendingCounterReset = false; node.writeSingleRegister(20213, 1); delay(100); node.writeSingleRegister(10112, 1); delay(100); }
-  if (!webUpdateActive && now - lastUpdateMs >= (uint32_t)(cfgUpdateIntervalSec * 1000.0f)) { lastUpdateMs = now; pollModbusOnce(); }
+
+  if (setupMode) {
+    dnsServer.processNextRequest();
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED && now - lastWifiReconnectMs >= WIFI_RECONNECT_INTERVAL_MS) {
+    lastWifiReconnectMs = now;
+    WiFi.reconnect();
+  }
+
+  if (pendingCounterReset) {
+    pendingCounterReset = false;
+    node.writeSingleRegister(20213, 1);
+    delay(100);
+    node.writeSingleRegister(10112, 1);
+    delay(100);
+  }
+
+  if (!webUpdateActive && now - lastUpdateMs >= (uint32_t)(cfgUpdateIntervalSec * 1000.0f)) {
+    lastUpdateMs = now;
+    pollModbusOnce();
+  }
 }
