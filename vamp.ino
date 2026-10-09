@@ -277,7 +277,158 @@ const InverterConfig inverterConfigs[] = {
     .slaveId  = 0x01,
     .baudRate = 9600
   },
+    // ──────────────── DEYE (1-phase & 3-phase) ────────────────
+  // Примітка: Однофазні та трифазні інвертори Deye (серія SUN) мають 
+  // ідентичну карту базових регістрів. Для трифазних тут вказані параметри фази L1.
+  {
+    .id   = "DEYE_1PH_3PH",
+    .name = "Deye 1ph/3ph 2PV (SUN Series)",
+    
+    // Блоки читаються через Function 0x03 (Holding Registers)
+    .invBlockAddr = 587,   // Початок блоку: Battery Voltage
+    .invBlockLen  = 40,    // Охоплює 587..626 (Batt, Grid, Inv, Power)
+    .pvBlockAddr  = 672,   // Початок блоку: PV1 Voltage
+    .pvBlockLen   = 15,    // Охоплює 672..686 (PV1, PV2, Total PV Power)
+    
+    .pvWork       = {672, 1.0f},    // PV1 Voltage (якщо > 0, значить PV працює)
+    .mppt         = {672, 1.0f},    // Proxy для MPPT
+    .chg          = {589, 1.0f},    // Battery SOC (%) як індикатор стану заряду
+    
+    .pvV          = {672, 10.0f},   // PV1 Voltage (0.1V)
+    .pvI          = {673, 10.0f},   // PV1 Current (0.1A)
+    .pvPower      = {684, 1.0f},    // Total PV Power (1W) - сума всіх MPPT
+    
+    .systemV      = {587, 100.0f},  // Battery Voltage (0.01V) - є основною напругою системи
+    .pvEnergyHi   = {696, 1.0f},    // PV Energy Total (1 kWh)
+    .pvEnergyLo   = {0, 1.0f},      // Не використовується окремо для Deye
+    
+    .invWorkState = {0, 1.0f},      // ⚠️ Deye не має єдиного регістру "Work State" як SRNE. 
+                                    // Залишаємо 0, стан визначається за потоками потужності.
+    .invV_1       = {604, 10.0f},   // Inverter Voltage L1 (0.1V)
+    .battV        = {587, 100.0f},  // Battery Voltage (0.01V)
+    .invV_0       = {598, 10.0f},   // Grid Voltage L1 (0.1V)
+    .invI         = {605, 10.0f},   // Inverter Current L1 (0.1A)
+    .invPower     = {622, 1.0f},    // Inverter Active Power (1W, signed: + discharge, - charge)
+    .gridFreq     = {599, 100.0f},  // Grid Frequency (0.01Hz)
+    
+    .acChgHi      = {704, 1.0f},    // AC Charge Energy Total (1 kWh)
+    .acChgLo      = {0, 1.0f},      // Не використовується
+    
+    .battCurrentAddr  = {588, 10.0f}, // Battery Current (0.1A, signed: + charge, - discharge)
+    .battPowerAddr    = {590, 1.0f},  // Battery Power (1W, signed: + charge, - discharge)
+    
+    .resetCounter1Addr = 0,         // Deye не має простого Modbus-регістру для скидання лічильників
+    .resetCounter2Addr = 0,
+    .machineTypeAddr   = 0,         // Модель визначається через веб-інтерфейс або Wi-Fi модуль
+    .machinePowerAddr  = 0,
+    
+    .slaveId  = 0x01,               // Стандартний Slave ID для Deye
+    .baudRate = 9600                // Стандартна швидкість
+  },
+
+  // ──────────────── LUX POWER ────────────────
+  // Примітка: Інвертори Lux Power серії SNA (SNA3000-6000) архітектурно 
+  // є ребрендингом Deye SUN Series і мають ІДЕНТИЧНУ карту Modbus регістрів.
+  {
+    .id   = "LUX_POWER",
+    .name = "Lux Power SNA 2PV (3000-6000W)",
+    
+    .invBlockAddr = 587,
+    .invBlockLen  = 40,
+    .pvBlockAddr  = 672,
+    .pvBlockLen   = 15,
+    
+    .pvWork       = {672, 1.0f},
+    .mppt         = {672, 1.0f},
+    .chg          = {589, 1.0f},
+    
+    .pvV          = {672, 10.0f},
+    .pvI          = {673, 10.0f},
+    .pvPower      = {684, 1.0f},
+    
+    .systemV      = {587, 100.0f},
+    .pvEnergyHi   = {696, 1.0f},
+    .pvEnergyLo   = {0, 1.0f},
+    
+    .invWorkState = {0, 1.0f},
+    .invV_1       = {604, 10.0f},
+    .battV        = {587, 100.0f},
+    .invV_0       = {598, 10.0f},
+    .invI         = {605, 10.0f},
+    .invPower     = {622, 1.0f},
+    .gridFreq     = {599, 100.0f},
+    
+    .acChgHi      = {704, 1.0f},
+    .acChgLo      = {0, 1.0f},
+    
+    .battCurrentAddr  = {588, 10.0f},
+    .battPowerAddr    = {590, 1.0f},
+    
+    .resetCounter1Addr = 0,
+    .resetCounter2Addr = 0,
+    .machineTypeAddr   = 0,
+    .machinePowerAddr  = 0,
+    
+    .slaveId  = 0x01,
+    .baudRate = 9600
+  },
+
+  // ──────────────── GROWATT SPF (Off-Grid) ────────────────
+  // Примітка: Це офіційна карта для SPF5000/SPF6000. 
+  // ⚠️ УВАГА: Більшість цих регістрів є Input Registers (Function 0x04). 
+  // Якщо ваша функція readModbusBlock використовує ТІЛЬКИ readHoldingRegisters (0x03), 
+  // дані можуть не читатися. У такому разі змініть виклик у readModbusBlock на 
+  // node.readInputRegisters для адрес < 10000, або використовуйте бібліотеку, 
+  // яка автоматично мапить адреси 3xxxx на Function 0x04.
+  {
+    .id   = "GROWATT_SPF",
+    .name = "Growatt SPF5000 / SPF6000 (Off-Grid)",
+    
+    // Для Growatt SPF всі основні дані йдуть підряд у Input Registers, 
+    // тому можна прочитати один великий блок.
+    .invBlockAddr = 0,     // Початок Input Registers
+    .invBlockLen  = 40,    // Охоплює 0..39 (включає PV, Batt, Grid, Inv)
+    .pvBlockAddr  = 0,     // Не потрібен окремий блок, все є в invBlock
+    .pvBlockLen   = 0,
+    
+    .pvWork       = {0, 1.0f},    // System Status (0=Standby, 5=PV charge, 6=AC charge, 7=Combine)
+    .mppt         = {7, 1.0f},    // Buck1 Current (якщо > 0, MPPT1 працює)
+    .chg          = {0, 1.0f},    // System Status містить інформацію про заряд
+    
+    .pvV          = {1, 10.0f},   // Vpv1 (0.1V)
+    .pvI          = {7, 10.0f},   // Buck1Curr (0.1A)
+    .pvPower      = {3, 10.0f},   // Ppv1 H (0.1W)
+    
+    .systemV      = {17, 100.0f}, // Bat Volt (0.01V) ⚠️ Перевірте: у деяких прошивках 10.0f (0.1V)
+    .pvEnergyHi   = {50, 10.0f},  // Epv1_totalH (0.1kWh)
+    .pvEnergyLo   = {51, 10.0f},  // Epv1_totalL (0.1kWh)
+    
+    .invWorkState = {0, 1.0f},    // System Status
+    .invV_1       = {22, 10.0f},  // OutputVolt (0.1V)
+    .battV        = {17, 100.0f}, // Bat Volt (0.01V)
+    .invV_0       = {20, 10.0f},  // Grid Volt (0.1V)
+    .invI         = {34, 10.0f},  // OP_Curr (0.1A)
+    .invPower     = {9, 10.0f},   // OP_Watt H (0.1W)
+    .gridFreq     = {21, 100.0f}, // Line Freq (0.01Hz)
+    
+    .acChgHi      = {58, 10.0f},  // Eac_chrTotal H (0.1kWh)
+    .acChgLo      = {59, 10.0f},  // Eac_chrTotal L (0.1kWh)
+    
+    .battCurrentAddr  = {95, 10.0f},  // BMS_BatteryCurr (0.1A). Якщо BMS немає, буде 0.
+    .battPowerAddr    = {77, 10.0f},  // Bat_Watt H (0.1W, signed: + discharge, - charge)
+    
+    // Ці регістри є Holding Registers (Function 0x03), тому вони читаються коректно 
+    // вашою поточною функцією readModbusBlock.
+    .resetCounter1Addr = 32,      // Reset User Info (записати 0x0001)
+    .resetCounter2Addr = 33,      // Reset to factory (записати 0x0001)
+    .machineTypeAddr   = 28,      // Module H
+    .machinePowerAddr  = 76,      // Rate Watt H (0.1W)
+    
+    .slaveId  = 0x01,             // Стандартний Slave ID для Growatt
+    .baudRate = 9600              // Стандартна швидкість для Growatt Off-Grid
+  },
 };
+
 const int NUM_INVERTER_MODELS = sizeof(inverterConfigs) / sizeof(inverterConfigs[0]);
 
 int cfgInverterModelIdx = 0; // Індекс обраної моделі інвертора
