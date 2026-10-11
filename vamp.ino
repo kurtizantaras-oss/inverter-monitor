@@ -12,7 +12,7 @@
 #define TX2_PIN 17
 #define RS485_CTRL 4
 #define LED_PIN 2
-#define SKETCH_VERSION "7.2.0"
+#define SKETCH_VERSION "7.1.0" // FreeRTOS + повна конфігурація з дільниками
 #define SERIAL_BUF_SIZE 4096
 
 // ========================================================================
@@ -59,14 +59,6 @@ float invI = 0.00f;
 float gridFreq = 0.00f;
 float systemV = 0.00f;
 
-int32_t pvEnergyHi = 0;
-int32_t pvEnergyLo = 0;
-int32_t acChgHi = 0;
-int32_t acChgLo = 0;
-int32_t pvWorkState = 0;
-int32_t mpptState = 0;
-int32_t chgState = 0;
-
 int32_t freePower = 0;
 int32_t currentPower = 0;
 int32_t pvPower = 0;
@@ -87,19 +79,23 @@ static portMUX_TYPE serialMux = portMUX_INITIALIZER_UNLOCKED;
 // КОНФІГУРАЦІЯ ТИПІВ ІНВЕРТОРІВ
 // ========================================================================
 struct RegAddr {
-  uint16_t addr;
-  uint16_t divisor;
+  uint16_t addr;      // ПОВНА абсолютна адреса регістру
+  int16_t divisor;   // Дільник (1, 10, 100, 1000). 0 → трактується як 1
+  int16_t maxPorog;  // Мінімальний порог для другого дільника
+  int16_t divisortwo;// Дільник 2 (1, 10, 100, 1000). 0 → трактується як 1
 };
 
 struct InverterConfig {
   const char* id;
   const char* name;
 
+  // ---- Блоки для масового читання ----
   uint16_t invBlockAddr;
   uint8_t  invBlockLen;
   uint16_t pvBlockAddr;
   uint8_t  pvBlockLen;
 
+  // ---- PV ----
   RegAddr pvWork;
   RegAddr mppt;
   RegAddr chg;
@@ -110,6 +106,7 @@ struct InverterConfig {
   RegAddr pvEnergyHi;
   RegAddr pvEnergyLo;
 
+  // ---- Інвертор ----
   RegAddr invWorkState;
   RegAddr invV_1;
   RegAddr battV;
@@ -120,9 +117,11 @@ struct InverterConfig {
   RegAddr acChgHi;
   RegAddr acChgLo;
 
+  // ---- Акумулятор ----
   RegAddr battCurrentAddr;
   RegAddr battPowerAddr;
 
+  // ---- Службові ----
   uint16_t resetCounter1Addr;
   uint16_t resetCounter2Addr;
   uint16_t machineTypeAddr;
@@ -157,12 +156,12 @@ const InverterConfig inverterConfigs[] = {
     .invV_0       = {25206, 10},
     .invI         = {25212, 10},
     .invPower     = {25219, 1},
-    .gridFreq     = {25225, 100},
+    .gridFreq     = {25225, 100, 0 , 0},
     .acChgHi      = {25255, 10},
     .acChgLo      = {25256, 10},
 
-    .battCurrentAddr  = {25274, 10},
-    .battPowerAddr    = {25273, 1},
+    .battCurrentAddr  = {25274, -1, 50, -10},
+    .battPowerAddr    = {25273, -1},
 
     .resetCounter1Addr = 20213,
     .resetCounter2Addr = 10112,
@@ -264,15 +263,19 @@ inline uint16_t getReg(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen
   return buf[idx];
 }
 
-inline uint16_t safeDivisor(uint16_t d) {
-  return (d == 0) ? 1 : d;
+inline int32_t safeDivisor(int16_t d) {
+  return (d == 0) ? 1 : (int32_t)d;
 }
 
 float readScaled(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, const RegAddr& r) {
   if (r.addr == 0) return 0.0f;
   uint16_t raw = getReg(buf, blockAddr, blockLen, r.addr);
   if (raw == 0xFFFF) return 0.0f;
-  return (float)raw / (float)safeDivisor(r.divisor);
+  if (abs(r.maxPorog) > 0 ) {
+    return (float)raw / (float)safeDivisor(r.divisortwo);
+  } else {
+    return (float)raw / (float)safeDivisor(r.divisor);
+  }
 }
 
 int32_t readRaw(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, const RegAddr& r) {
@@ -320,6 +323,8 @@ void requireLocalIP(AsyncWebServerRequest *request, std::function<void(AsyncWebS
 }
 
 struct InverterData {
+  uint16_t inv[80];
+  uint16_t pv[20];
   int workState = 0;
   const char* stateStr = "OFF";
   String machineType, machinePower;
@@ -454,8 +459,8 @@ void applyInverterConfig() {
 
   char logLine[128];
   snprintf(logLine, sizeof(logLine),
-    ">>> Inverter config switched to: %s (slaveId=0x%02X, baud=%lu)\n",
-    invCfg.name, invCfg.slaveId, (unsigned long)invCfg.baudRate);
+           ">>> Inverter config switched to: %s (slaveId=0x%02X, baud=%lu)\n",
+           invCfg.name, invCfg.slaveId, (unsigned long)invCfg.baudRate);
   serialLog(logLine);
 }
 
@@ -490,6 +495,7 @@ void triacTask(void *pvParameters) {
 
 // ========================================================================
 // ОСНОВНА ФУНКЦІЯ ОПИТУВАННЯ MODBUS
+// Світлодіод: мигає під час читання, горить у стані спокою
 // ========================================================================
 void pollModbusOnce() {
   bool ok = true;
@@ -499,6 +505,7 @@ void pollModbusOnce() {
 
   const InverterConfig& invCfg = inverterConfigs[cfgInverterModelIdx];
 
+  // ---- Читання блоку інвертора ----
   if (invCfg.invBlockAddr > 0 && invCfg.invBlockLen > 0) {
     digitalWrite(LED_PIN, HIGH);
     vTaskDelay(pdMS_TO_TICKS(30));
@@ -511,6 +518,7 @@ void pollModbusOnce() {
     digitalWrite(LED_PIN, LOW);
   }
 
+  // ---- Читання блоку PV ----
   if (invCfg.pvBlockAddr > 0 && invCfg.pvBlockLen > 0) {
     digitalWrite(LED_PIN, HIGH);
     vTaskDelay(pdMS_TO_TICKS(30));
@@ -530,6 +538,9 @@ void pollModbusOnce() {
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
+  memcpy(inv.inv, invBuf, sizeof(inv.inv));
+  memcpy(inv.pv, pvBuf, sizeof(inv.pv));
+
   // ---- Розбір даних ----
   inv.workState = readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.invWorkState);
 
@@ -544,43 +555,40 @@ void pollModbusOnce() {
     default: inv.stateStr = "UNKNOWN"; break;
   }
 
-  // ---- PV ----
   pvV      = readScaled(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.pvV);
   pvI      = readScaled(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.pvI);
   pvPower  = readScaledInt(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.pvPower);
   systemV  = readScaled(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.systemV);
 
-  pvWorkState = readRaw(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.pvWork);
-  mpptState   = readRaw(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.mppt);
-  chgState    = readRaw(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.chg);
-  pvEnergyHi  = readRaw(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.pvEnergyHi);
-  pvEnergyLo  = readRaw(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.pvEnergyLo);
-
-  // ---- Інвертор ----
   invV     = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.invV_0);
   if (invV == 0.0f) invV = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.invV_1);
   invI     = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.invI);
   invPower = readScaledInt(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.invPower);
-  gridFreq = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.gridFreq);
   battV    = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.battV);
-
-  acChgHi  = readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.acChgHi);
-  acChgLo  = readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.acChgLo);
+  gridFreq = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.gridFreq);
 
   // ---- Акумулятор ----
   uint16_t rawBattI = (invCfg.battCurrentAddr.addr > 0)
-                        ? readSingleRegisterWithRetry(invCfg.battCurrentAddr.addr)
-                        : 0xFFFF;
+                      ? readSingleRegisterWithRetry(invCfg.battCurrentAddr.addr)
+                      : 0xFFFF;
   if (rawBattI == 0xFFFF) {
     battI = 0.0f;
   } else {
     int16_t signedVal = (int16_t)rawBattI;
-    battI = (float)signedVal / (float)safeDivisor(invCfg.battCurrentAddr.divisor);
+    int16_t absVal = (signedVal < 0) ? -signedVal : signedVal;
+
+    int16_t divt;
+    if (absVal > invCfg.battCurrentAddr.maxPorog) {
+      divt = invCfg.battCurrentAddr.divisortwo;    // велике значення → менший дільник
+    } else {
+      divt = invCfg.battCurrentAddr.divisor;   // мале значення → більший дільник
+    }
+    battI = (float)signedVal / (float)safeDivisor(divt);
   }
 
   uint16_t rawBattP = (invCfg.battPowerAddr.addr > 0)
-                        ? readSingleRegisterWithRetry(invCfg.battPowerAddr.addr)
-                        : 0xFFFF;
+                      ? readSingleRegisterWithRetry(invCfg.battPowerAddr.addr)
+                      : 0xFFFF;
   if (rawBattP == 0xFFFF) {
     battPower = 0.0f;
   } else {
@@ -628,9 +636,9 @@ void pollModbusOnce() {
     } else if (freePower == 0) {
       targMessage = "Потужність на максимумі";
     } else {
-      if (freePower > 19) {
-        currentPower += 20;
-        targMessage = "Потужність збільшена на 20 ВА";
+      if (freePower > cfgMaxAllocatedVA / 10) {
+        currentPower += cfgMaxAllocatedVA / 10;
+        targMessage = "Потужність збільшена на 0.1 від потужності";
       } else {
         currentPower += freePower;
         targMessage = "Потужність збільшено";
@@ -645,6 +653,7 @@ void pollModbusOnce() {
 
   PpowerHeater = currentPower;
 
+  // ---- ЄДИНЕ МІСЦЕ РОЗРАХУНКУ ВІДСОТКА ПОТУЖНОСТІ НАГРІВАЧА ----
   if (cfgHeaterPowerVA > 0) {
     currentHeaterPercent = constrain((PpowerHeater * 100) / cfgHeaterPowerVA, 0, 100);
   } else {
@@ -656,11 +665,11 @@ void pollModbusOnce() {
 
   char logLine[256];
   snprintf(logLine, sizeof(logLine),
-    "[%lu] ws=%d pvV=%.1f pvI=%.1f sysV=%.1f invV=%.0f invI=%.1f freq=%.1f battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d pph=%d triac=%d%% sw=%d msg=%s\n",
-    millis(), inv.workState, pvV, pvI, systemV, invV, invI, gridFreq,
-    battV, battI, battPower, (int)pvPower, (int)invPower, (int)freePower,
-    (int)currentPower, (int)PpowerHeater, currentTriacDuty,
-    switch_state ? 1 : 0, targMessage);
+           "[%lu] ws=%d pvV=%.1f pvI=%.1f sysV=%.1f invV=%.0f invI=%.1f freq=%.1f battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d pph=%d triac=%d%% sw=%d msg=%s\n",
+           millis(), inv.workState, pvV, pvI, systemV, invV, invI, gridFreq,
+           battV, battI, battPower, (int)pvPower, (int)invPower, (int)freePower,
+           (int)currentPower, (int)PpowerHeater, currentTriacDuty,
+           switch_state ? 1 : 0, targMessage);
   serialLog(logLine);
 
   xSemaphoreGive(dataMutex);
@@ -1137,15 +1146,24 @@ void setupWebServer() {
     doc["sw"] = switch_state ? 1 : 0;
     doc["tm"] = targMessageGlobal;
 
-    doc["pvV"] = pvV; doc["pvI"] = pvI; doc["pvPower"] = (int)pvPower;
+    doc["pvV"] = pvV; doc["pvI"] = pvI; 
+    doc["pvPower"] = (int)pvPower;
     doc["systemV"] = systemV;
-    doc["invV"] = invV; doc["invI"] = invI; doc["invPower"] = (int)invPower;
-    doc["battV"] = battV; doc["battI"] = battI; doc["battPower"] = battPower;
-    doc["pvEnergyHi"] = (unsigned)pvEnergyHi; doc["pvEnergyLo"] = (unsigned)pvEnergyLo;
-    doc["acChgHi"] = (unsigned)acChgHi; doc["acChgLo"] = (unsigned)acChgLo;
+    doc["invV"] = invV; 
+    doc["invI"] = invI; 
+    doc["invPower"] = (int)invPower;
+    doc["battV"] = battV; 
+    doc["battI"] = battI; 
+    doc["battPower"] = battPower;
     doc["freq"] = gridFreq;
-    doc["pvWork"] = (unsigned)pvWorkState; doc["mppt"] = (unsigned)mpptState;
-    doc["chg"] = (unsigned)chgState; doc["rssi"] = WiFi.RSSI();
+    doc["pvEnergyHi"] = (unsigned)inv.pv[16]; 
+    doc["pvEnergyLo"] = (unsigned)inv.pv[17];
+    doc["acChgHi"] = (unsigned)inv.inv[54]; 
+    doc["acChgLo"] = (unsigned)inv.inv[55];
+    doc["pvWork"] = (unsigned)inv.pv[0]; 
+    doc["mppt"] = (unsigned)inv.pv[1];
+    doc["chg"] = (unsigned)inv.pv[2]; 
+    doc["rssi"] = WiFi.RSSI();
 
     auto* res = r->beginResponseStream("application/json; charset=utf-8");
     serializeJson(doc, *res);
@@ -1312,12 +1330,15 @@ void setup() {
 
   MDNS.begin("inverter");
 
+  // М'ютекси створюються ДО applyInverterConfig()
   dataMutex = xSemaphoreCreateMutex();
   modbusMutex = xSemaphoreCreateMutex();
 
+  // Ініціалізація UART, Modbus та читання інформації про інвертор
   applyInverterConfig();
   delay(1000);
 
+  // ---- ШІМ для сімістора ----
   pinMode(TRIAC_PIN, OUTPUT);
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcAttach(TRIAC_PIN, TRIAC_PWM_FREQ, TRIAC_PWM_RES);
@@ -1329,6 +1350,7 @@ void setup() {
 
   setupWebServer();
 
+  // ---- Запуск задач ----
   xTaskCreatePinnedToCore(triacTask,  "triacTask",  2048, nullptr, 2, &triacTaskHandle,  0);
   xTaskCreatePinnedToCore(modbusTask, "modbusTask", 4096, nullptr, 1, &modbusTaskHandle, 0);
 
