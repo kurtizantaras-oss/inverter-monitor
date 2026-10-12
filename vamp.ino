@@ -20,11 +20,11 @@
 // ========================================================================
 #define TRIAC_PIN 19
 
-constexpr uint32_t TRIAC_WINDOW_MS = 1000;  // 100 полуперіодів при 50 Гц → 1% роздільна
+constexpr uint32_t TRIAC_WINDOW_MS = 1000;
 constexpr uint32_t TRIAC_TICK_MS   = 10;
 
-uint8_t currentTriacDuty = 0;      // миттєвий стан виходу (для логу)
-uint8_t currentHeaterPercent = 0;  // бажаний % (з розрахунку)
+uint8_t currentTriacDuty = 0;
+uint8_t currentHeaterPercent = 0;
 
 TaskHandle_t triacTaskHandle = nullptr;
 TaskHandle_t modbusTaskHandle = nullptr;
@@ -244,12 +244,26 @@ void requireLocalIP(AsyncWebServerRequest *request, std::function<void(AsyncWebS
   handler(request);
 }
 
+// ========================================================================
+// InverterData — тепер містить обчислені (через RegAddr) поля.
+// Більше не покладаємось на хардкод індексів inv.pv[16], inv.inv[54] тощо.
+// ========================================================================
 struct InverterData {
   uint16_t inv[80];
   uint16_t pv[20];
   int workState = 0;
   const char* stateStr = "OFF";
   String machineType, machinePower;
+
+  // Обчислені значення (через RegAddr з конфігу інвертора).
+  // Універсально для будь-якої моделі, у якої заповнені відповідні поля.
+  uint16_t pvWork = 0;
+  uint16_t mppt = 0;
+  uint16_t chg = 0;
+  uint16_t pvEnergyHi = 0;
+  uint16_t pvEnergyLo = 0;
+  uint16_t acChgHi = 0;
+  uint16_t acChgLo = 0;
 };
 
 AsyncWebServer server(80);
@@ -296,10 +310,6 @@ uint16_t readSingleRegisterWithRetry(uint16_t addr, uint8_t retries = 3) {
 
 // ========================================================================
 // НАЛАШТУВАННЯ
-// ВАЖЛИВО: дефолт heaterVA = 100, НЕ 0! Інакше % не рахується.
-// ПУНКТ 5 ЗАСТОСОВАНО: дефолти getFloat/getUShort узгоджені з глобальними
-// значеннями змінних (27.0 / 0.5 / 29.0), щоб при порожньому NVS
-// не отримувати 20.0 замість 27.0/29.0 після constrain().
 // ========================================================================
 void loadSettings() {
   preferences.begin("settings", true);
@@ -309,11 +319,11 @@ void loadSettings() {
   cfgHeaterPowerVA      = preferences.getUShort("heaterVA",  100);
   cfgMaxAllocatedVA     = preferences.getUShort("maxAllocVA", 100);
   cfgUpdateIntervalSec  = constrain(preferences.getFloat("updIntSec", DEFAULT_UPDATE_INTERVAL_SEC), 0.5f, 10.0f);
-  cfgBattOffVoltage     = constrain(preferences.getFloat("battOffV", 27.0f), 20.0f, 80.0f);   // ← 27.0 (було 0.0)
-  cfgBattHysteresisV    = constrain(preferences.getFloat("battHystV", 0.5f), 0.0f, 10.0f);    // ← 0.5  (було 0.25)
+  cfgBattOffVoltage     = constrain(preferences.getFloat("battOffV", 27.0f), 20.0f, 80.0f);
+  cfgBattHysteresisV    = constrain(preferences.getFloat("battHystV", 0.5f), 0.0f, 10.0f);
   cfgBattOffCurrent     = constrain(preferences.getFloat("battOffI", 0.0f), -100.0f, 100.0f);
   cfgFullChargeCurrentA = constrain(preferences.getFloat("chgCurA", 0.0f), -100.0f, 100.0f);
-  cfgFullChargeVoltage  = constrain(preferences.getFloat("fullChgV", 29.0f), 20.0f, 80.0f);   // ← 29.0 (було 0.0)
+  cfgFullChargeVoltage  = constrain(preferences.getFloat("fullChgV", 29.0f), 20.0f, 80.0f);
   switch_state          = preferences.getBool("swState", false);
   preferences.end();
 }
@@ -494,6 +504,17 @@ void pollModbusOnce() {
   battV    = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.battV);
   gridFreq = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.gridFreq);
 
+  // ---- Обчислення через RegAddr (універсально для будь-якої моделі) ----
+  // Замінює собою жорсткі зсуви inv.pv[0], inv.pv[1], inv.pv[2], inv.pv[16], inv.pv[17],
+  // inv.inv[54], inv.inv[55], які працювали тільки для SRNE.
+  inv.pvWork     = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.pvWork);
+  inv.mppt       = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.mppt);
+  inv.chg        = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.chg);
+  inv.pvEnergyHi = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.pvEnergyHi);
+  inv.pvEnergyLo = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.pvEnergyLo);
+  inv.acChgHi    = (uint16_t)readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.acChgHi);
+  inv.acChgLo    = (uint16_t)readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.acChgLo);
+
   // ---- Батарея: обробка вже прочитаного rawBattI / rawBattP ----
   if (rawBattI == 0xFFFF) {
     battI = 0.0f;
@@ -514,8 +535,6 @@ void pollModbusOnce() {
   }
 
   // ---- Розрахунок вільної потужності ----
-  // Якщо тумблер вимкнено — тримаємо freePower та currentPower на нулі,
-  // щоб накопичення не відновлювалося після кожного опитування Modbus.
   if (!switch_state) {
     freePower = 0;
     currentPower = 0;
@@ -535,7 +554,6 @@ void pollModbusOnce() {
   const char* targMessage = "Все добре";
 
   if (!switch_state) {
-    // Тумблер вимкнено — нічого не рахуємо
     freePower = 0;
     currentPower = 0;
     targMessage = "Споживання вимкнено";
@@ -551,23 +569,20 @@ void pollModbusOnce() {
     targMessage = "Напруга акумулятора менше встановленого мінімуму";
   }
   else if (freePower < 0) {
-    // Дефіцит: зменшуємо поточну потужність на величину дефіциту
-    currentPower += freePower;          // freePower < 0 → currentPower зменшується
+    currentPower += freePower;
     if (currentPower < 0) currentPower = 0;
     freePower = 0;
     targMessage = "Недостатньо потужності";
   }
-  else if (battI < cfgBattOffCurrent && battV < cfgFullChargeVoltage) {   // ← battI, не pvI
+  else if (battI < cfgBattOffCurrent && battV < cfgFullChargeVoltage) {
     freePower = 0;
     currentPower = 0;
     targMessage = "Струм акумулятора менше встановленого мінімуму";
   }
-
   else if (freePower == 0) {
     targMessage = "Потужність на максимумі";
   }
   else {
-    // freePower > 0: плавно нарощуємо
     if (currentPower >= cfgMaxAllocatedVA) {
       currentPower = cfgMaxAllocatedVA;
       targMessage = "Потужність обрізано до максимуму";
@@ -822,7 +837,6 @@ hSlider.style.background = hColor;
 document.getElementById("hSliderText").innerText = hpct + "%";document.getElementById("hSliderText").style.color = hColor;
 if(d.hva)document.getElementById("hNominal").innerText="("+d.hva+" VA nominal)";
 updateSwitchUI(d.sw);
-// Ховаємо кнопку Firmware Update для не-локальних клієнтів
 if(d.isLocal === 0){
   let fb=document.getElementById("fwBtn"); if(fb) fb.style.display="none";
   let us=document.getElementById("updateSection"); if(us){us.style.display="none";us.classList.remove("active");}
@@ -864,12 +878,6 @@ fetchLog();setInterval(fetchLog,2000);
 </script></body></html>
 )rawliteral";
 
-// ========================================================================
-// SETTINGS_HTML — ПУНКТ 5: значення value та min узгоджені з backend
-// battOffV: min=20 (було 0), value=27 (було 0)
-// battHystV: value=0.5 (було 0.25)
-// fullChgV: без змін (value=29, min=20)
-// ========================================================================
 const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Settings</title>
@@ -1048,13 +1056,8 @@ void startSetupAP() {
 // ОНОВЛЕННЯ ПРОШИВКИ — ЛИШЕ З ЛОКАЛЬНОЇ МЕРЕЖІ
 // ========================================================================
 void onUpdateUpload(AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
-  // ЗАБОРОНА: не приймаємо байти від не-локальних клієнтів.
-  // Перевірка ТУТ обов'язкова: цей колбек викликається під час стрімінгу тіла
-  // запиту, ще до фінального POST-хендлера. Якщо перевіряти лише там — байти
-  // вже будуть записані у флеш.
   if (!request->client() || !isLocalIP(request->client()->remoteIP())) {
     if (!index) {
-      // Перший чанк — не даємо навіть почати, скасовуємо Update.
       Update.abort();
       webUpdateActive = false;
     }
@@ -1103,15 +1106,15 @@ void setupWebServer() {
     doc["invPower"] = (int)invPower;
     doc["battV"] = battV; doc["battI"] = battI; doc["battPower"] = battPower;
     doc["freq"] = gridFreq;
-    doc["pvEnergyHi"] = (unsigned)inv.pv[16];
-    doc["pvEnergyLo"] = (unsigned)inv.pv[17];
-    doc["acChgHi"] = (unsigned)inv.inv[54];
-    doc["acChgLo"] = (unsigned)inv.inv[55];
-    doc["pvWork"] = (unsigned)inv.pv[0];
-    doc["mppt"] = (unsigned)inv.pv[1];
-    doc["chg"] = (unsigned)inv.pv[2];
+    // Обчислені через RegAddr значення (працює для будь-якої моделі)
+    doc["pvEnergyHi"] = (unsigned)inv.pvEnergyHi;
+    doc["pvEnergyLo"] = (unsigned)inv.pvEnergyLo;
+    doc["acChgHi"]    = (unsigned)inv.acChgHi;
+    doc["acChgLo"]    = (unsigned)inv.acChgLo;
+    doc["pvWork"]     = (unsigned)inv.pvWork;
+    doc["mppt"]       = (unsigned)inv.mppt;
+    doc["chg"]        = (unsigned)inv.chg;
     doc["rssi"] = WiFi.RSSI();
-    // Прапорець для UI: чи можна показувати кнопку Firmware Update
     doc["isLocal"] = (r->client() && isLocalIP(r->client()->remoteIP())) ? 1 : 0;
     auto* res = r->beginResponseStream("application/json; charset=utf-8");
     serializeJson(doc, *res);
@@ -1189,7 +1192,7 @@ void setupWebServer() {
       if (req->hasParam("updIntSec", true)) cfgUpdateIntervalSec = constrain(req->getParam("updIntSec", true)->value().toFloat(), 0.5f, 10.0f);
       if (req->hasParam("battOffV", true)) cfgBattOffVoltage = constrain(req->getParam("battOffV", true)->value().toFloat(), 20.0f, 80.0f);
       if (req->hasParam("battHystV", true)) cfgBattHysteresisV = constrain(req->getParam("battHystV", true)->value().toFloat(), 0.0f, 10.0f);
-      if (req->hasParam("battOffI", true)) cfgBattOffCurrent = constrain(req->getParam("battOffI", true)->value().toFloat(), -100.0f, 100.0f);  // ← узгоджено з loadSettings
+      if (req->hasParam("battOffI", true)) cfgBattOffCurrent = constrain(req->getParam("battOffI", true)->value().toFloat(), -100.0f, 100.0f);
       if (req->hasParam("chgCurA", true)) cfgFullChargeCurrentA = constrain(req->getParam("chgCurA", true)->value().toFloat(), -100.0f, 100.0f);
       if (req->hasParam("fullChgV", true)) cfgFullChargeVoltage = constrain(req->getParam("fullChgV", true)->value().toFloat(), 20.0f, 80.0f);
 
@@ -1209,7 +1212,6 @@ void setupWebServer() {
     requireLocalIP(r, [](AsyncWebServerRequest *req) {
       switch_state = !switch_state;
 
-      // Якщо вимкнули — одразу обнуляємо freePower та пов'язані величини під м'ютексом.
       if (!switch_state && dataMutex &&
           xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         freePower = 0;
@@ -1243,14 +1245,10 @@ void setupWebServer() {
     requireLocalIP(r, [](AsyncWebServerRequest *req) { pendingCounterReset = true; req->send(200, "text/plain", "OK"); });
   });
 
-  // ============================================================
-  // ОНОВЛЕННЯ ПРОШИВКИ — доступне ТІЛЬКИ з локальної мережі
-  // ============================================================
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest *r) {
-    // Захист: нелокальним клієнтам навіть фінальну відповідь не даємо OK
     if (!r->client() || !isLocalIP(r->client()->remoteIP())) {
       webUpdateActive = false;
-      Update.abort();  // страховка: якщо раптом щось устигло початися — скасовуємо
+      Update.abort();
       r->send(403, "text/plain", "Access denied: Local network only");
       return;
     }
