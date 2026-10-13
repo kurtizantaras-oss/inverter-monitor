@@ -12,7 +12,7 @@
 #define TX2_PIN 17
 #define RS485_CTRL 4
 #define LED_PIN 2
-#define SKETCH_VERSION "7.2.2"
+#define SKETCH_VERSION "7.2.4"
 #define SERIAL_BUF_SIZE 4096
 
 // ========================================================================
@@ -23,8 +23,8 @@
 constexpr uint32_t TRIAC_WINDOW_MS = 1000;
 constexpr uint32_t TRIAC_TICK_MS   = 10;
 
-uint8_t currentTriacDuty = 0;
-uint8_t currentHeaterPercent = 0;
+volatile uint8_t currentTriacDuty     = 0;
+volatile uint8_t currentHeaterPercent = 0;
 
 TaskHandle_t triacTaskHandle = nullptr;
 TaskHandle_t modbusTaskHandle = nullptr;
@@ -32,11 +32,13 @@ TaskHandle_t modbusTaskHandle = nullptr;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 12000;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
 constexpr uint32_t RESTART_DELAY_MS = 2000;
+constexpr uint32_t WEB_UPDATE_TIMEOUT_MS = 30000;
 constexpr float DEFAULT_UPDATE_INTERVAL_SEC = 2.0f;
 
 SemaphoreHandle_t dataMutex = nullptr;
 SemaphoreHandle_t modbusMutex = nullptr;
 volatile bool webUpdateActive = false;
+volatile unsigned long lastWebUpdateActivityMs = 0;
 volatile bool pendingCounterReset = false;
 
 static uint16_t invBuf[80], pvBuf[20];
@@ -66,7 +68,7 @@ int32_t PpowerHeater = 0;
 float battI = 0.00f;
 float battPower = 0.00f;
 
-bool switch_state = false;
+volatile bool switch_state = false;
 static char targMessageGlobal[128] = "--";
 
 static char serialBuf[SERIAL_BUF_SIZE];
@@ -128,20 +130,33 @@ const InverterConfig inverterConfigs[] = {
   {
     .id   = "SRNE",
     .name = "Must (Standard)/ SRNE / EASUN",
-    .invBlockAddr = 25201, .invBlockLen = 56,
-    .pvBlockAddr  = 15201, .pvBlockLen  = 18,
-    .pvWork       = {15201, 1}, .mppt = {15202, 1}, .chg = {15203, 1},
-    .pvV          = {15206, 10}, .pvI = {15207, 10}, .pvPower = {15208, 1},
-    .systemV      = {15215, 1},  .pvEnergyHi = {15217, 10}, .pvEnergyLo = {15218, 10},
-    .invWorkState = {25201, 1},  .invV_1 = {25202, 10}, .battV = {25205, 10},
-    .invV_0       = {25206, 10}, .invI = {25212, 10}, .invPower = {25219, 1},
+    .invBlockAddr = 25201,
+    .invBlockLen = 56,
+    .pvBlockAddr  = 15201,
+    .pvBlockLen  = 18,
+    .pvWork       = {15201, 1},
+    .mppt = {15202, 1}, .chg = {15203, 1},
+    .pvV          = {15206, 10},
+    .pvI = {15207, 10},
+    .pvPower = {15208, 1},
+    .systemV      = {15215, 1},
+    .pvEnergyHi = {15217, 1}, .pvEnergyLo = {15218, 1},
+    .invWorkState = {25201, 1},
+    .invV_1 = {25202, 10},
+    .battV = {25205, 10},
+    .invV_0       = {25206, 10},
+    .invI = {25212, 10},
+    .invPower = {25219, 1},
     .gridFreq     = {25225, 100, 0 , 0},
-    .acChgHi      = {25255, 10}, .acChgLo = {25256, 10},
+    .acChgHi      = {25255, 1}, .acChgLo = {25256, 1},
     .battCurrentAddr  = {25274, -1, 50, -10},
     .battPowerAddr    = {25273, -1},
-    .resetCounter1Addr = 20213, .resetCounter2Addr = 10112,
-    .machineTypeAddr   = 20000, .machinePowerAddr  = 20001,
-    .slaveId = 0x04, .baudRate = 19200
+    .resetCounter1Addr = 20213,
+    .resetCounter2Addr = 10112,
+    .machineTypeAddr   = 20000,
+    .machinePowerAddr  = 20001,
+    .slaveId = 0x04,
+    .baudRate = 19200
   },
   {
     .id = "GROWATT", .name = "Growatt (Заготовка)",
@@ -192,12 +207,23 @@ inline int32_t safeDivisor(int16_t d) {
   return (d == 0) ? 1 : (int32_t)d;
 }
 
+inline int32_t absInt16(int16_t v) {
+  int32_t x = (int32_t)v;
+  return (x < 0) ? -x : x;
+}
+
 float readScaled(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, const RegAddr& r) {
   if (r.addr == 0) return 0.0f;
-  uint16_t raw = getReg(buf, blockAddr, blockLen, r.addr);
-  if (raw == 0xFFFF) return 0.0f;
-  if (abs(r.maxPorog) > 0) return (float)raw / (float)safeDivisor(r.divisortwo);
-  return (float)raw / (float)safeDivisor(r.divisor);
+  uint16_t rawU = getReg(buf, blockAddr, blockLen, r.addr);
+  if (rawU == 0xFFFF) return 0.0f;
+
+  int16_t raw    = (int16_t)rawU;
+  int32_t absVal = absInt16(raw);
+  int32_t mp     = absInt16(r.maxPorog);
+
+  int16_t divt = (mp > 0 && absVal > mp) ? r.divisortwo : r.divisor;
+
+  return (float)raw / (float)safeDivisor(divt);
 }
 
 int32_t readRaw(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, const RegAddr& r) {
@@ -209,9 +235,15 @@ int32_t readRaw(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, const
 
 int32_t readScaledInt(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, const RegAddr& r) {
   if (r.addr == 0) return 0;
-  uint16_t raw = getReg(buf, blockAddr, blockLen, r.addr);
-  if (raw == 0xFFFF) return 0;
-  return (int32_t)raw / (int32_t)safeDivisor(r.divisor);
+  uint16_t rawU = getReg(buf, blockAddr, blockLen, r.addr);
+  if (rawU == 0xFFFF) return 0;
+
+  int16_t raw    = (int16_t)rawU;
+  int32_t absVal = absInt16(raw);
+  int32_t mp     = absInt16(r.maxPorog);
+  int16_t divt   = (mp > 0 && absVal > mp) ? r.divisortwo : r.divisor;
+
+  return (int32_t)raw / (int32_t)safeDivisor(divt);
 }
 
 void serialLog(const char* msg) {
@@ -245,8 +277,7 @@ void requireLocalIP(AsyncWebServerRequest *request, std::function<void(AsyncWebS
 }
 
 // ========================================================================
-// InverterData — тепер містить обчислені (через RegAddr) поля.
-// Більше не покладаємось на хардкод індексів inv.pv[16], inv.inv[54] тощо.
+// InverterData
 // ========================================================================
 struct InverterData {
   uint16_t inv[80];
@@ -255,8 +286,6 @@ struct InverterData {
   const char* stateStr = "OFF";
   String machineType, machinePower;
 
-  // Обчислені значення (через RegAddr з конфігу інвертора).
-  // Універсально для будь-якої моделі, у якої заповнені відповідні поля.
   uint16_t pvWork = 0;
   uint16_t mppt = 0;
   uint16_t chg = 0;
@@ -303,7 +332,7 @@ uint16_t readSingleRegisterWithRetry(uint16_t addr, uint8_t retries = 3) {
   for (uint8_t i = 0; i < retries; i++) {
     node.clearResponseBuffer();
     if (node.readHoldingRegisters(addr, 1) == node.ku8MBSuccess) return node.getResponseBuffer(0);
-    delay(150);
+    vTaskDelay(pdMS_TO_TICKS(150));
   }
   return 0xFFFF;
 }
@@ -389,49 +418,44 @@ void applyInverterConfig() {
 // ЗАДАЧА КЕРУВАННЯ СІМІСТОРОМ — BURST CONTROL
 // ========================================================================
 void triacTask(void *pvParameters) {
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(TRIAC_TICK_MS);
   uint32_t windowStart = millis();
 
   for (;;) {
-    uint8_t targetPercent = 0;
-
-    if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      if (switch_state) targetPercent = currentHeaterPercent;
-      xSemaphoreGive(dataMutex);
-    }
+    uint8_t targetPercent = switch_state ? currentHeaterPercent : 0;
 
     if (targetPercent == 0) {
       digitalWrite(TRIAC_PIN, LOW);
       currentTriacDuty = 0;
       windowStart = millis();
-      vTaskDelay(pdMS_TO_TICKS(TRIAC_TICK_MS));
-      continue;
-    }
-    if (targetPercent >= 100) {
+    } else if (targetPercent >= 100) {
       digitalWrite(TRIAC_PIN, HIGH);
       currentTriacDuty = 100;
       windowStart = millis();
-      vTaskDelay(pdMS_TO_TICKS(TRIAC_TICK_MS));
-      continue;
-    }
-
-    uint32_t now = millis();
-    uint32_t elapsed = now - windowStart;
-    if (elapsed >= TRIAC_WINDOW_MS) {
-      windowStart = now;
-      elapsed = 0;
-    }
-
-    uint32_t onTimeMs = (TRIAC_WINDOW_MS * (uint32_t)targetPercent) / 100;
-
-    if (elapsed < onTimeMs) {
-      digitalWrite(TRIAC_PIN, HIGH);
-      currentTriacDuty = targetPercent;
     } else {
-      digitalWrite(TRIAC_PIN, LOW);
-      currentTriacDuty = 0;
+      uint32_t now = millis();
+      uint32_t elapsed = now - windowStart;
+      if (elapsed >= TRIAC_WINDOW_MS) {
+        windowStart += TRIAC_WINDOW_MS;
+        if ((int32_t)(now - windowStart) >= (int32_t)TRIAC_WINDOW_MS) {
+          windowStart = now;
+        }
+        elapsed = now - windowStart;
+      }
+
+      uint32_t onTimeMs = (TRIAC_WINDOW_MS * (uint32_t)targetPercent) / 100;
+
+      if (elapsed < onTimeMs) {
+        digitalWrite(TRIAC_PIN, HIGH);
+        currentTriacDuty = targetPercent;
+      } else {
+        digitalWrite(TRIAC_PIN, LOW);
+        currentTriacDuty = 0;
+      }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(TRIAC_TICK_MS));
+    vTaskDelayUntil(&lastWakeTime, period);
   }
 }
 
@@ -446,9 +470,6 @@ void pollModbusOnce() {
 
   const InverterConfig& invCfg = inverterConfigs[cfgInverterModelIdx];
 
-  // ============================================================
-  // ФАЗА 1: УСІ MODBUS-ОПЕРАЦІЇ (БЕЗ dataMutex!)
-  // ============================================================
   if (invCfg.invBlockAddr > 0 && invCfg.invBlockLen > 0) {
     digitalWrite(LED_PIN, HIGH); vTaskDelay(pdMS_TO_TICKS(30)); digitalWrite(LED_PIN, LOW);
     if (!readModbusBlock(invCfg.invBlockAddr, invCfg.invBlockLen, invBuf)) ok = false;
@@ -466,15 +487,11 @@ void pollModbusOnce() {
     return;
   }
 
-  // Одиничні читання батареї — ТУТ, до м'ютекса!
   uint16_t rawBattI = (invCfg.battCurrentAddr.addr > 0)
                       ? readSingleRegisterWithRetry(invCfg.battCurrentAddr.addr) : 0xFFFF;
   uint16_t rawBattP = (invCfg.battPowerAddr.addr > 0)
                       ? readSingleRegisterWithRetry(invCfg.battPowerAddr.addr) : 0xFFFF;
 
-  // ============================================================
-  // ФАЗА 2: ШВИДКИЙ ПАРСИНГ ПІД dataMutex (мікросекунди)
-  // ============================================================
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
   memcpy(inv.inv, invBuf, sizeof(inv.inv));
@@ -504,9 +521,6 @@ void pollModbusOnce() {
   battV    = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.battV);
   gridFreq = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.gridFreq);
 
-  // ---- Обчислення через RegAddr (універсально для будь-якої моделі) ----
-  // Замінює собою жорсткі зсуви inv.pv[0], inv.pv[1], inv.pv[2], inv.pv[16], inv.pv[17],
-  // inv.inv[54], inv.inv[55], які працювали тільки для SRNE.
   inv.pvWork     = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.pvWork);
   inv.mppt       = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.mppt);
   inv.chg        = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.chg);
@@ -515,15 +529,15 @@ void pollModbusOnce() {
   inv.acChgHi    = (uint16_t)readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.acChgHi);
   inv.acChgLo    = (uint16_t)readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.acChgLo);
 
-  // ---- Батарея: обробка вже прочитаного rawBattI / rawBattP ----
   if (rawBattI == 0xFFFF) {
     battI = 0.0f;
   } else {
     int16_t signedVal = (int16_t)rawBattI;
-    int16_t absVal = (signedVal < 0) ? -signedVal : signedVal;
-    int16_t divt = (absVal > invCfg.battCurrentAddr.maxPorog)
-                   ? invCfg.battCurrentAddr.divisortwo
-                   : invCfg.battCurrentAddr.divisor;
+    int32_t absVal    = absInt16(signedVal);
+    int32_t mp        = absInt16(invCfg.battCurrentAddr.maxPorog);
+    int16_t divt      = (mp > 0 && absVal > mp)
+                        ? invCfg.battCurrentAddr.divisortwo
+                        : invCfg.battCurrentAddr.divisor;
     battI = (float)signedVal / (float)safeDivisor(divt);
   }
 
@@ -534,14 +548,13 @@ void pollModbusOnce() {
     battPower = (float)signedVal / (float)safeDivisor(invCfg.battPowerAddr.divisor);
   }
 
-  // ---- Розрахунок вільної потужності ----
   if (!switch_state) {
     freePower = 0;
     currentPower = 0;
   } else {
     freePower = pvPower - invPower;
-    if (battV < cfgFullChargeVoltage || battI < cfgFullChargeCurrentA) {
-      freePower -= (int32_t)(pvV * cfgFullChargeCurrentA);
+    if (cfgFullChargeCurrentA > 0.0f && battV < cfgFullChargeVoltage) {
+      freePower -= (int32_t)(battV * cfgFullChargeCurrentA);
     }
   }
 
@@ -610,7 +623,7 @@ void pollModbusOnce() {
   strncpy(targMessageGlobal, targMessage, sizeof(targMessageGlobal) - 1);
   targMessageGlobal[sizeof(targMessageGlobal) - 1] = '\0';
 
-  char logLine[288];
+  char logLine[512];
   snprintf(logLine, sizeof(logLine),
            "[%lu] ws=%d pvV=%.1f pvI=%.1f sysV=%.1f invV=%.0f invI=%.1f freq=%.1f "
            "battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d pph=%d "
@@ -784,7 +797,15 @@ function fmt0(v,unit){if(isBad(v))return"--";return Math.round(Number(v))+(unit?
 function fmtKwh(hi,lo){if(isBad(hi)||isBad(lo))return"--";return(hi*1000+lo/10).toFixed(1)+" kWh"}
 function toggleUpdate(){document.getElementById("updateSection").classList.toggle("active")}
 async function resetWifi(){if(confirm("Reset WiFi?")){await fetch("/reset_wifi");location.reload()}}
-async function resetCounters(){if(!confirm("Reset all counters?"))return;await fetch("/reset_counters");alert("Done")}
+async function resetCounters(){
+  if(!confirm("Reset all counters?"))return;
+  try{
+    let r = await fetch("/reset_counters");
+    if(r.status===200) alert("Reset command sent");
+    else if(r.status===403) alert("Access denied: Local network only");
+    else alert("Error: "+r.status);
+  }catch(e){ alert("Connection error"); }
+}
 async function restartEsp(){if(!confirm("Restart ESP32?"))return;await fetch("/restart");alert("Restarting...");setTimeout(()=>location.reload(),5000)}
 function doUpdate(){
 let f=document.getElementById("fwfile").files[0];
@@ -1019,6 +1040,26 @@ upd();setInterval(upd,2000);
 // ========================================================================
 void triggerReboot() { needRestart = true; restartRequestedMs = millis(); }
 
+static String jsonEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if ((uint8_t)c < 0x20) {
+          char b[8]; snprintf(b, sizeof(b), "\\u%04x", (uint8_t)c); out += b;
+        } else out += c;
+    }
+  }
+  return out;
+}
+
 void startSetupAP() {
   setupMode = true;
   WiFi.mode(WIFI_AP);
@@ -1026,18 +1067,24 @@ void startSetupAP() {
   dnsServer.start(53, "*", WiFi.softAPIP());
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) { r->send_P(200, "text/html", SETUP_HTML); });
+
   server.on("/scan_wifi", HTTP_GET, [](AsyncWebServerRequest* r) {
     int n = WiFi.scanNetworks();
     auto* res = r->beginResponseStream("application/json");
     res->print("[");
     for (int i = 0; i < n; i++) {
       if (i) res->print(",");
-      res->printf("{\"ssid\":\"%s\",\"rssi\":%d}", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+      res->print("{\"ssid\":\"");
+      res->print(jsonEscape(WiFi.SSID(i)));
+      res->print("\",\"rssi\":");
+      res->print(WiFi.RSSI(i));
+      res->print("}");
     }
     res->print("]");
     WiFi.scanDelete();
     r->send(res);
   });
+
   server.on("/save_wifi", HTTP_POST, [](AsyncWebServerRequest* r) {
     if (r->hasParam("ssid", true) && r->hasParam("password", true)) {
       preferences.begin("wifi_config", false);
@@ -1064,9 +1111,15 @@ void onUpdateUpload(AsyncWebServerRequest* request, String filename, size_t inde
     return;
   }
 
+  lastWebUpdateActivityMs = millis();
+
   if (!index) {
     webUpdateActive = true;
-    if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) Update.printError(Serial);
+    if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) {
+      Update.printError(Serial);
+      webUpdateActive = false;
+      return;
+    }
   }
   if (!Update.hasError() && Update.write(data, len) != len) Update.printError(Serial);
   if (final) {
@@ -1086,8 +1139,13 @@ void setupWebServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", INDEX_HTML); });
 
   server.on("/api", HTTP_GET, [](AsyncWebServerRequest *r) {
-    bool locked = dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE;
-    DynamicJsonDocument doc(1024);
+    bool locked = dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1000)) == pdTRUE;
+
+    char targCopy[sizeof(targMessageGlobal)];
+    strncpy(targCopy, targMessageGlobal, sizeof(targCopy));
+    targCopy[sizeof(targCopy) - 1] = '\0';
+
+    DynamicJsonDocument doc(2048);
     doc["ws"] = inv.workState;
     doc["mt"] = inv.machineType;
     doc["mp"] = inv.machinePower;
@@ -1098,7 +1156,7 @@ void setupWebServer() {
     doc["hva"] = (unsigned)cfgHeaterPowerVA;
     doc["maVA"] = (unsigned)cfgMaxAllocatedVA;
     doc["sw"] = switch_state ? 1 : 0;
-    doc["tm"] = targMessageGlobal;
+    doc["tm"] = targCopy;
     doc["pvV"] = pvV; doc["pvI"] = pvI;
     doc["pvPower"] = (int)pvPower;
     doc["systemV"] = systemV;
@@ -1106,7 +1164,6 @@ void setupWebServer() {
     doc["invPower"] = (int)invPower;
     doc["battV"] = battV; doc["battI"] = battI; doc["battPower"] = battPower;
     doc["freq"] = gridFreq;
-    // Обчислені через RegAddr значення (працює для будь-якої моделі)
     doc["pvEnergyHi"] = (unsigned)inv.pvEnergyHi;
     doc["pvEnergyLo"] = (unsigned)inv.pvEnergyLo;
     doc["acChgHi"]    = (unsigned)inv.acChgHi;
@@ -1149,14 +1206,28 @@ void setupWebServer() {
   server.on("/serial", HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", SERIAL_HTML); });
 
   server.on("/api_serial", HTTP_GET, [](AsyncWebServerRequest *r) {
-    char tmp[SERIAL_BUF_SIZE];
+    auto* res = r->beginResponseStream("text/plain; charset=utf-8");
+
+    uint16_t t;
     portENTER_CRITICAL(&serialMux);
-    uint16_t h = serialHead, t = serialTail;
+    t = serialTail;
     portEXIT_CRITICAL(&serialMux);
-    uint16_t len = 0;
-    while (t != h && len < SERIAL_BUF_SIZE - 1) { tmp[len++] = serialBuf[t]; t = (t + 1) % SERIAL_BUF_SIZE; }
-    tmp[len] = '\0';
-    r->send(200, "text/plain; charset=utf-8", tmp);
+
+    char chunk[64];
+    while (true) {
+      uint16_t chunkLen = 0;
+      portENTER_CRITICAL(&serialMux);
+      uint16_t h = serialHead;
+      while (t != h && chunkLen < sizeof(chunk)) {
+        chunk[chunkLen++] = serialBuf[t];
+        t = (t + 1) % SERIAL_BUF_SIZE;
+      }
+      portEXIT_CRITICAL(&serialMux);
+
+      if (chunkLen == 0) break;
+      res->write((const uint8_t*)chunk, chunkLen);
+    }
+    r->send(res);
   });
 
   server.on("/signal", HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", SIGNAL_HTML); });
@@ -1179,31 +1250,52 @@ void setupWebServer() {
 
   server.on("/save_settings", HTTP_POST, [](AsyncWebServerRequest *r) {
     requireLocalIP(r, [](AsyncWebServerRequest *req) {
-      bool modelChanged = false;
+      int newModelToApply = -1;
       if (req->hasParam("invModel", true)) {
         int newModel = req->getParam("invModel", true)->value().toInt();
         if (newModel >= 0 && newModel < NUM_INVERTER_MODELS && newModel != cfgInverterModelIdx) {
-          cfgInverterModelIdx = newModel;
-          modelChanged = true;
+          newModelToApply = newModel;
         }
       }
-      if (req->hasParam("heaterVA", true)) cfgHeaterPowerVA = constrain(req->getParam("heaterVA", true)->value().toInt(), 100, 15000);
-      if (req->hasParam("maxAllocVA", true)) cfgMaxAllocatedVA = constrain(req->getParam("maxAllocVA", true)->value().toInt(), 100, 15000);
-      if (req->hasParam("updIntSec", true)) cfgUpdateIntervalSec = constrain(req->getParam("updIntSec", true)->value().toFloat(), 0.5f, 10.0f);
-      if (req->hasParam("battOffV", true)) cfgBattOffVoltage = constrain(req->getParam("battOffV", true)->value().toFloat(), 20.0f, 80.0f);
-      if (req->hasParam("battHystV", true)) cfgBattHysteresisV = constrain(req->getParam("battHystV", true)->value().toFloat(), 0.0f, 10.0f);
-      if (req->hasParam("battOffI", true)) cfgBattOffCurrent = constrain(req->getParam("battOffI", true)->value().toFloat(), -100.0f, 100.0f);
-      if (req->hasParam("chgCurA", true)) cfgFullChargeCurrentA = constrain(req->getParam("chgCurA", true)->value().toFloat(), -100.0f, 100.0f);
-      if (req->hasParam("fullChgV", true)) cfgFullChargeVoltage = constrain(req->getParam("fullChgV", true)->value().toFloat(), 20.0f, 80.0f);
 
-      saveSettings();
+      uint16_t newHeaterVA   = cfgHeaterPowerVA;
+      uint16_t newMaxAllocVA = cfgMaxAllocatedVA;
+      float    newUpdInt     = cfgUpdateIntervalSec;
+      float    newBattOffV   = cfgBattOffVoltage;
+      float    newBattHystV  = cfgBattHysteresisV;
+      float    newBattOffI   = cfgBattOffCurrent;
+      float    newChgCurA    = cfgFullChargeCurrentA;
+      float    newFullChgV   = cfgFullChargeVoltage;
 
-      if (modelChanged) {
+      if (req->hasParam("heaterVA",   true)) newHeaterVA   = constrain(req->getParam("heaterVA",   true)->value().toInt(),   100,   15000);
+      if (req->hasParam("maxAllocVA", true)) newMaxAllocVA = constrain(req->getParam("maxAllocVA", true)->value().toInt(),   100,   15000);
+      if (req->hasParam("updIntSec",  true)) newUpdInt     = constrain(req->getParam("updIntSec",  true)->value().toFloat(), 0.5f,  10.0f);
+      if (req->hasParam("battOffV",   true)) newBattOffV   = constrain(req->getParam("battOffV",   true)->value().toFloat(), 20.0f, 80.0f);
+      if (req->hasParam("battHystV",  true)) newBattHystV  = constrain(req->getParam("battHystV",  true)->value().toFloat(), 0.0f,  10.0f);
+      if (req->hasParam("battOffI",   true)) newBattOffI   = constrain(req->getParam("battOffI",   true)->value().toFloat(), -100.0f, 100.0f);
+      if (req->hasParam("chgCurA",    true)) newChgCurA    = constrain(req->getParam("chgCurA",    true)->value().toFloat(), -100.0f, 100.0f);
+      if (req->hasParam("fullChgV",   true)) newFullChgV   = constrain(req->getParam("fullChgV",   true)->value().toFloat(), 20.0f, 80.0f);
+
+      if (dataMutex && xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+        cfgHeaterPowerVA      = newHeaterVA;
+        cfgMaxAllocatedVA     = newMaxAllocVA;
+        cfgUpdateIntervalSec  = newUpdInt;
+        cfgBattOffVoltage     = newBattOffV;
+        cfgBattHysteresisV    = newBattHystV;
+        cfgBattOffCurrent     = newBattOffI;
+        cfgFullChargeCurrentA = newChgCurA;
+        cfgFullChargeVoltage  = newFullChgV;
+        xSemaphoreGive(dataMutex);
+      }
+
+      if (newModelToApply >= 0) {
         if (xSemaphoreTake(modbusMutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+          cfgInverterModelIdx = newModelToApply;
           applyInverterConfig();
           xSemaphoreGive(modbusMutex);
         }
       }
+      saveSettings();
       req->send(200, "text/plain", "OK");
     });
   });
@@ -1260,8 +1352,27 @@ void setupWebServer() {
   server.begin();
 }
 
+// ========================================================================
+// Расшифровка кодов статуса ModbusMaster (реальные константы библиотеки)
+// ========================================================================
+const char* mbErrStr(uint8_t st) {
+  switch (st) {
+    case 0x00: return "SUCCESS";
+    case 0xE0: return "INVALID_SLAVE_ID";
+    case 0xE1: return "INVALID_FUNCTION";   // также Modbus exception
+    case 0xE2: return "RESPONSE_TIMEOUT";
+    case 0xE3: return "INVALID_CRC";
+    default:   return "UNKNOWN";
+  }
+}
+
 void setup() {
   Serial.begin(115200);
+
+  pinMode(TRIAC_PIN, OUTPUT);
+  digitalWrite(TRIAC_PIN, LOW);
+  currentTriacDuty = 0;
+
   pinMode(RS485_CTRL, OUTPUT); digitalWrite(RS485_CTRL, LOW);
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH);
   WiFi.persistent(false);
@@ -1287,36 +1398,100 @@ void setup() {
   applyInverterConfig();
   delay(1000);
 
-  pinMode(TRIAC_PIN, OUTPUT);
-  digitalWrite(TRIAC_PIN, LOW);
-  currentTriacDuty = 0;
-
   setupWebServer();
 
   xTaskCreatePinnedToCore(triacTask,  "triacTask",  2048, nullptr, 2, &triacTaskHandle,  0);
   xTaskCreatePinnedToCore(modbusTask, "modbusTask", 4096, nullptr, 1, &modbusTaskHandle, 0);
 
-  serialLog("=== System started (Burst Control v7.2.2) ===\n");
+  serialLog("=== System started (Burst Control v7.2.4) ===\n");
 }
 
 void loop() {
   unsigned long now = millis();
   if (needRestart && now - restartRequestedMs >= RESTART_DELAY_MS) ESP.restart();
-  if (setupMode) { dnsServer.processNextRequest(); return; }
+
+  if (setupMode) {
+    dnsServer.processNextRequest();
+    vTaskDelay(pdMS_TO_TICKS(5));
+    return;
+  }
+
+  if (webUpdateActive && (now - lastWebUpdateActivityMs) > WEB_UPDATE_TIMEOUT_MS) {
+    webUpdateActive = false;
+    Update.abort();
+    serialLog("OTA timeout — webUpdateActive cleared\n");
+  }
 
   if (WiFi.status() != WL_CONNECTED && now - lastWifiReconnectMs >= WIFI_RECONNECT_INTERVAL_MS) {
     lastWifiReconnectMs = now;
     WiFi.reconnect();
   }
 
+  // ========================================================================
+  // СБРОС СЧЁТЧИКОВ — fallback 0x06(val=1) → 0x10(val=1) → 0x10(val=0)
+  // Регистр 20213 у SRNE/Must часто принимает только 0x10 или только val=0.
+  // ========================================================================
   if (pendingCounterReset) {
     pendingCounterReset = false;
-    if (xSemaphoreTake(modbusMutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+
+    if (xSemaphoreTake(modbusMutex, portMAX_DELAY) == pdTRUE) {
       const InverterConfig& invCfg = inverterConfigs[cfgInverterModelIdx];
-      if (invCfg.resetCounter1Addr > 0) { node.writeSingleRegister(invCfg.resetCounter1Addr, 1); delay(100); }
-      if (invCfg.resetCounter2Addr > 0) { node.writeSingleRegister(invCfg.resetCounter2Addr, 1); delay(100); }
+
+      // ---- RESET 1 ----
+      if (invCfg.resetCounter1Addr > 0) {
+        uint8_t st = 0xEE;
+
+        // Попытка 1: writeSingleRegister (0x06), val=1
+        node.clearResponseBuffer();
+        st = node.writeSingleRegister(invCfg.resetCounter1Addr, 1);
+
+        // Попытка 2: writeMultipleRegisters (0x10), val=1
+        if (st != node.ku8MBSuccess) {
+          vTaskDelay(pdMS_TO_TICKS(100));
+          node.clearResponseBuffer();
+          node.setTransmitBuffer(0, 1);
+          st = node.writeMultipleRegisters(invCfg.resetCounter1Addr, 1);
+        }
+
+        // Попытка 3: writeMultipleRegisters (0x10), val=0
+        if (st != node.ku8MBSuccess) {
+          vTaskDelay(pdMS_TO_TICKS(100));
+          node.clearResponseBuffer();
+          node.setTransmitBuffer(0, 0);
+          st = node.writeMultipleRegisters(invCfg.resetCounter1Addr, 1);
+        }
+
+        char l[192];
+        if (st == node.ku8MBInvalidFunction) {
+          uint16_t exc = node.getResponseBuffer(0);
+          snprintf(l, sizeof(l),
+                   ">>> RESET1 0x%04X status=EXCEPTION exc=0x%02X\n",
+                   invCfg.resetCounter1Addr, exc);
+        } else {
+          snprintf(l, sizeof(l),
+                   ">>> RESET1 0x%04X final_status=0x%02X (%s)\n",
+                   invCfg.resetCounter1Addr, st, mbErrStr(st));
+        }
+        serialLog(l);
+        vTaskDelay(pdMS_TO_TICKS(150));
+      }
+
+      // ---- RESET 2 ----
+      if (invCfg.resetCounter2Addr > 0) {
+        node.clearResponseBuffer();
+        uint8_t st = node.writeSingleRegister(invCfg.resetCounter2Addr, 1);
+
+        char l[192];
+        snprintf(l, sizeof(l),
+                 ">>> RESET2 0x%04X status=0x%02X (%s)\n",
+                 invCfg.resetCounter2Addr, st, mbErrStr(st));
+        serialLog(l);
+        vTaskDelay(pdMS_TO_TICKS(150));
+      }
+
       xSemaphoreGive(modbusMutex);
     }
   }
+
   vTaskDelay(pdMS_TO_TICKS(50));
 }
