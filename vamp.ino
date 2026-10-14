@@ -1,7 +1,6 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
-#include <ModbusMaster.h>
 #include <Preferences.h>
 #include <DNSServer.h>
 #include <Update.h>
@@ -40,6 +39,7 @@ SemaphoreHandle_t modbusMutex = nullptr;
 volatile bool webUpdateActive = false;
 volatile unsigned long lastWebUpdateActivityMs = 0;
 volatile bool pendingCounterReset = false;
+volatile bool dumpEnabled = false;
 
 static uint16_t invBuf[80], pvBuf[20];
 
@@ -66,7 +66,7 @@ int32_t pvPower = 0;
 int32_t invPower = 0;
 int32_t PpowerHeater = 0;
 float battI = 0.00f;
-float battPower = 0.00f;
+float battP = 0.00f;
 
 volatile bool switch_state = false;
 static char targMessageGlobal[128] = "--";
@@ -115,8 +115,8 @@ struct InverterConfig {
   RegAddr acChgHi;
   RegAddr acChgLo;
 
-  RegAddr battCurrentAddr;
-  RegAddr battPowerAddr;
+  RegAddr battI;
+  RegAddr battP;
 
   uint16_t resetCounter1Addr;
   uint16_t resetCounter2Addr;
@@ -131,7 +131,7 @@ const InverterConfig inverterConfigs[] = {
     .id   = "SRNE",
     .name = "Must (Standard)/ SRNE / EASUN",
     .invBlockAddr = 25201,
-    .invBlockLen = 56,
+    .invBlockLen = 80,
     .pvBlockAddr  = 15201,
     .pvBlockLen  = 18,
     .pvWork       = {15201, 1},
@@ -149,8 +149,8 @@ const InverterConfig inverterConfigs[] = {
     .invPower = {25219, 1},
     .gridFreq     = {25225, 100, 0 , 0},
     .acChgHi      = {25255, 1}, .acChgLo = {25256, 1},
-    .battCurrentAddr  = {25274, -1, 50, -10},
-    .battPowerAddr    = {25273, -1},
+    .battI  = {25274, -1, 50, -10},
+    .battP    = {25273, -1},
     .resetCounter1Addr = 20213,
     .resetCounter2Addr = 10112,
     .machineTypeAddr   = 20000,
@@ -165,7 +165,7 @@ const InverterConfig inverterConfigs[] = {
     .pvPower = {0, 1}, .systemV = {0, 1}, .pvEnergyHi = {0, 1}, .pvEnergyLo = {0, 1},
     .invWorkState = {0, 1}, .invV_1 = {0, 1}, .battV = {0, 1}, .invV_0 = {0, 1},
     .invI = {0, 1}, .invPower = {0, 1}, .gridFreq = {0, 1}, .acChgHi = {0, 1}, .acChgLo = {0, 1},
-    .battCurrentAddr = {0, 1}, .battPowerAddr = {0, 1},
+    .battI = {0, 1}, .battP = {0, 1},
     .resetCounter1Addr = 0, .resetCounter2Addr = 0,
     .machineTypeAddr = 0, .machinePowerAddr = 0,
     .slaveId = 0x01, .baudRate = 9600
@@ -177,7 +177,7 @@ const InverterConfig inverterConfigs[] = {
     .pvPower = {0, 1}, .systemV = {0, 1}, .pvEnergyHi = {0, 1}, .pvEnergyLo = {0, 1},
     .invWorkState = {0, 1}, .invV_1 = {0, 1}, .battV = {0, 1}, .invV_0 = {0, 1},
     .invI = {0, 1}, .invPower = {0, 1}, .gridFreq = {0, 1}, .acChgHi = {0, 1}, .acChgLo = {0, 1},
-    .battCurrentAddr = {0, 1}, .battPowerAddr = {0, 1},
+    .battI = {0, 1}, .battP = {0, 1},
     .resetCounter1Addr = 0, .resetCounter2Addr = 0,
     .machineTypeAddr = 0, .machinePowerAddr = 0,
     .slaveId = 0x01, .baudRate = 9600
@@ -186,6 +186,216 @@ const InverterConfig inverterConfigs[] = {
 const int NUM_INVERTER_MODELS = sizeof(inverterConfigs) / sizeof(inverterConfigs[0]);
 
 int cfgInverterModelIdx = 0;
+
+// ========================================================================
+// RAW MODBUS RTU — замість бібліотеки ModbusMaster
+// ========================================================================
+#define MB_SUCCESS           0x00
+#define MB_INVALID_SLAVE_ID  0xE0
+#define MB_INVALID_FUNCTION  0xE1
+#define MB_RESPONSE_TIMEOUT  0xE2
+#define MB_INVALID_CRC       0xE3
+
+static uint16_t modbusCRC16(const uint8_t* buf, uint16_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint16_t pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];
+    for (uint8_t i = 8; i != 0; i--) {
+      if ((crc & 0x0001) != 0) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+static void mbFlushRx() {
+  while (Serial1.available()) Serial1.read();
+}
+
+// --- Функція 0x03: читання holding-регістрів ---
+static uint8_t modbusReadHolding(uint16_t addr, uint8_t qty,
+                                 uint16_t* outRegs,
+                                 uint32_t timeoutMs = 1500) {
+  if (qty < 1 || qty > 125) return MB_INVALID_FUNCTION;
+
+  const InverterConfig& invCfg = inverterConfigs[cfgInverterModelIdx];
+  uint8_t slave = invCfg.slaveId;
+
+  uint8_t frame[8];
+  frame[0] = slave;
+  frame[1] = 0x03;
+  frame[2] = (addr >> 8) & 0xFF;
+  frame[3] = addr & 0xFF;
+  frame[4] = 0;
+  frame[5] = qty;
+  uint16_t crc = modbusCRC16(frame, 6);
+  frame[6] = crc & 0xFF;
+  frame[7] = crc >> 8;
+
+  mbFlushRx();
+
+  digitalWrite(RS485_CTRL, HIGH);
+  delayMicroseconds(100);
+  Serial1.write(frame, 8);
+  Serial1.flush();
+  delayMicroseconds(100);
+  digitalWrite(RS485_CTRL, LOW);
+
+  uint8_t rx[260];
+  uint16_t rxLen = 0;
+  uint16_t expected = 5;
+  uint32_t start = millis();
+
+  while (millis() - start < timeoutMs) {
+    while (Serial1.available() && rxLen < sizeof(rx)) {
+      rx[rxLen++] = Serial1.read();
+      if (rxLen >= 3 && rx[1] == 0x03) expected = 3 + rx[2] + 2;
+      if (rxLen >= 5 && rx[1] == 0x83) expected = 5;
+    }
+    if (rxLen >= expected) break;
+    delay(1);
+  }
+
+  if (rxLen == 0)    return MB_RESPONSE_TIMEOUT;
+  if (rxLen < 5)     return MB_RESPONSE_TIMEOUT;
+
+  uint16_t calc = modbusCRC16(rx, rxLen - 2);
+  uint16_t recv = rx[rxLen - 2] | ((uint16_t)rx[rxLen - 1] << 8);
+  if (calc != recv)  return MB_INVALID_CRC;
+
+  if (rx[1] == 0x83) return MB_INVALID_FUNCTION;
+  if (rx[0] != slave || rx[1] != 0x03) return MB_INVALID_SLAVE_ID;
+
+  uint8_t byteCount = rx[2];
+  if (rxLen < (uint16_t)(3 + byteCount + 2)) return MB_RESPONSE_TIMEOUT;
+  if ((byteCount / 2) < qty) return MB_RESPONSE_TIMEOUT;
+
+  for (uint16_t i = 0; i < qty; i++) {
+    outRegs[i] = ((uint16_t)rx[3 + 2 * i] << 8) | rx[3 + 2 * i + 1];
+  }
+  return MB_SUCCESS;
+}
+
+// --- Функція 0x06: запис одного регістра ---
+static uint8_t modbusWriteSingle(uint16_t addr, uint16_t value,
+                                 uint8_t* excCode = nullptr,
+                                 uint32_t timeoutMs = 1500) {
+  if (excCode) *excCode = 0;
+  const InverterConfig& invCfg = inverterConfigs[cfgInverterModelIdx];
+  uint8_t slave = invCfg.slaveId;
+
+  uint8_t frame[8];
+  frame[0] = slave;
+  frame[1] = 0x06;
+  frame[2] = (addr >> 8) & 0xFF;
+  frame[3] = addr & 0xFF;
+  frame[4] = (value >> 8) & 0xFF;
+  frame[5] = value & 0xFF;
+  uint16_t crc = modbusCRC16(frame, 6);
+  frame[6] = crc & 0xFF;
+  frame[7] = crc >> 8;
+
+  mbFlushRx();
+
+  digitalWrite(RS485_CTRL, HIGH);
+  delayMicroseconds(100);
+  Serial1.write(frame, 8);
+  Serial1.flush();
+  delayMicroseconds(100);
+  digitalWrite(RS485_CTRL, LOW);
+
+  uint8_t rx[16];
+  uint16_t rxLen = 0;
+  uint32_t start = millis();
+
+  while (millis() - start < timeoutMs) {
+    while (Serial1.available() && rxLen < sizeof(rx)) rx[rxLen++] = Serial1.read();
+    if (rxLen >= 8 || (rxLen >= 5 && (rx[1] & 0x80))) break;
+    delay(1);
+  }
+
+  if (rxLen < 5) return MB_RESPONSE_TIMEOUT;
+
+  uint16_t calc = modbusCRC16(rx, rxLen - 2);
+  uint16_t recv = rx[rxLen - 2] | ((uint16_t)rx[rxLen - 1] << 8);
+  if (calc != recv) return MB_INVALID_CRC;
+
+  if (rx[1] & 0x80) {
+    if (excCode) *excCode = rx[2];
+    return MB_INVALID_FUNCTION;
+  }
+
+  if (rxLen < 8) return MB_RESPONSE_TIMEOUT;
+  if (rx[0] != slave) return MB_INVALID_SLAVE_ID;
+  return MB_SUCCESS;
+}
+
+// --- Функція 0x10: запис кількох регістрів ---
+static uint8_t modbusWriteMultiple(uint16_t addr, const uint16_t* values, uint8_t qty,
+                                   uint8_t* excCode = nullptr,
+                                   uint32_t timeoutMs = 1500) {
+  if (excCode) *excCode = 0;
+  if (qty < 1 || qty > 123) return MB_INVALID_FUNCTION;
+
+  const InverterConfig& invCfg = inverterConfigs[cfgInverterModelIdx];
+  uint8_t slave = invCfg.slaveId;
+
+  uint8_t frame[260];
+  frame[0] = slave;
+  frame[1] = 0x10;
+  frame[2] = (addr >> 8) & 0xFF;
+  frame[3] = addr & 0xFF;
+  frame[4] = 0;
+  frame[5] = qty;
+  frame[6] = qty * 2;
+  for (uint8_t i = 0; i < qty; i++) {
+    frame[7 + 2 * i] = (values[i] >> 8) & 0xFF;
+    frame[8 + 2 * i] = values[i] & 0xFF;
+  }
+  uint16_t len = 7 + qty * 2;
+  uint16_t crc = modbusCRC16(frame, len);
+  frame[len]     = crc & 0xFF;
+  frame[len + 1] = crc >> 8;
+  len += 2;
+
+  mbFlushRx();
+
+  digitalWrite(RS485_CTRL, HIGH);
+  delayMicroseconds(100);
+  Serial1.write(frame, len);
+  Serial1.flush();
+  delayMicroseconds(100);
+  digitalWrite(RS485_CTRL, LOW);
+
+  uint8_t rx[16];
+  uint16_t rxLen = 0;
+  uint32_t start = millis();
+
+  while (millis() - start < timeoutMs) {
+    while (Serial1.available() && rxLen < sizeof(rx)) rx[rxLen++] = Serial1.read();
+    if (rxLen >= 8 || (rxLen >= 5 && (rx[1] & 0x80))) break;
+    delay(1);
+  }
+
+  if (rxLen < 5) return MB_RESPONSE_TIMEOUT;
+
+  uint16_t calc = modbusCRC16(rx, rxLen - 2);
+  uint16_t recv = rx[rxLen - 2] | ((uint16_t)rx[rxLen - 1] << 8);
+  if (calc != recv) return MB_INVALID_CRC;
+
+  if (rx[1] & 0x80) {
+    if (excCode) *excCode = rx[2];
+    return MB_INVALID_FUNCTION;
+  }
+
+  if (rxLen < 8) return MB_RESPONSE_TIMEOUT;
+  if (rx[0] != slave) return MB_INVALID_SLAVE_ID;
+  return MB_SUCCESS;
+}
 
 // ========================================================================
 // ДОПОМІЖНІ ФУНКЦІЇ
@@ -223,7 +433,9 @@ float readScaled(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, cons
 
   int16_t divt = (mp > 0 && absVal > mp) ? r.divisortwo : r.divisor;
 
-  return (float)raw / (float)safeDivisor(divt);
+  float v = (float)raw / (float)safeDivisor(divt);
+  if (v == 0.0f) v = 0.0f;   // -0.0 → +0.0
+  return v;
 }
 
 int32_t readRaw(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, const RegAddr& r) {
@@ -298,7 +510,6 @@ struct InverterData {
 AsyncWebServer server(80);
 DNSServer dnsServer;
 Preferences preferences;
-ModbusMaster node;
 InverterData inv;
 String wifiSsid, wifiPassword;
 bool setupMode = false;
@@ -306,32 +517,22 @@ unsigned long lastWifiReconnectMs = 0;
 bool needRestart = false;
 unsigned long restartRequestedMs = 0;
 
-void preTrans() {
-  digitalWrite(RS485_CTRL, HIGH);
-  delayMicroseconds(100);
-}
-void postTrans() {
-  delayMicroseconds(100);
-  Serial1.flush();
-  digitalWrite(RS485_CTRL, LOW);
-}
-
+// Обгортки над сирим Modbus для сумісності з рештою коду
 template<typename T>
 bool readModbusBlock(uint16_t addr, uint8_t qty, T* buf) {
   if (addr == 0 || qty == 0) return false;
-  node.clearResponseBuffer();
-  if (node.readHoldingRegisters(addr, qty) == node.ku8MBSuccess) {
-    for (uint8_t i = 0; i < qty; i++) buf[i] = node.getResponseBuffer(i);
-    return true;
-  }
-  return false;
+  if (qty > 125) return false;
+  uint16_t tmp[125];
+  if (modbusReadHolding(addr, qty, tmp) != MB_SUCCESS) return false;
+  for (uint8_t i = 0; i < qty; i++) buf[i] = (T)tmp[i];
+  return true;
 }
 
 uint16_t readSingleRegisterWithRetry(uint16_t addr, uint8_t retries = 3) {
   if (addr == 0) return 0xFFFF;
+  uint16_t tmp = 0;
   for (uint8_t i = 0; i < retries; i++) {
-    node.clearResponseBuffer();
-    if (node.readHoldingRegisters(addr, 1) == node.ku8MBSuccess) return node.getResponseBuffer(0);
+    if (modbusReadHolding(addr, 1, &tmp) == MB_SUCCESS) return tmp;
     vTaskDelay(pdMS_TO_TICKS(150));
   }
   return 0xFFFF;
@@ -381,9 +582,6 @@ void applyInverterConfig() {
   Serial1.end();
   delay(100);
   Serial1.begin(invCfg.baudRate, SERIAL_8N1, RX2_PIN, TX2_PIN);
-  node.begin(invCfg.slaveId, Serial1);
-  node.preTransmission(preTrans);
-  node.postTransmission(postTrans);
   delay(500);
 
   if (invCfg.machineTypeAddr > 0 && invCfg.machinePowerAddr > 0) {
@@ -487,10 +685,41 @@ void pollModbusOnce() {
     return;
   }
 
-  uint16_t rawBattI = (invCfg.battCurrentAddr.addr > 0)
-                      ? readSingleRegisterWithRetry(invCfg.battCurrentAddr.addr) : 0xFFFF;
-  uint16_t rawBattP = (invCfg.battPowerAddr.addr > 0)
-                      ? readSingleRegisterWithRetry(invCfg.battPowerAddr.addr) : 0xFFFF;
+  // ---- ДАМП (керується кнопкою в Serial Monitor) ----
+  if (dumpEnabled) {
+    char line[256];
+
+    // inv-блок
+    if (invCfg.invBlockLen > 0) {
+      int n = invCfg.invBlockLen;
+      for (int row = 0; row < n; row += 8) {
+        int pos = snprintf(line, sizeof(line), "inv[%04X]:",
+                           (unsigned)(invCfg.invBlockAddr + row));
+        for (int i = row; i < row + 8 && i < n; i++) {
+          pos += snprintf(line + pos, sizeof(line) - pos, " %04X", invBuf[i]);
+          if (pos >= (int)sizeof(line) - 8) break;
+        }
+        pos += snprintf(line + pos, sizeof(line) - pos, "\n");
+        serialLog(line);
+      }
+    }
+
+    // pv-блок
+    if (invCfg.pvBlockLen > 0) {
+      int n = invCfg.pvBlockLen;
+      for (int row = 0; row < n; row += 8) {
+        int pos = snprintf(line, sizeof(line), "pv [%04X]:",
+                           (unsigned)(invCfg.pvBlockAddr + row));
+        for (int i = row; i < row + 8 && i < n; i++) {
+          pos += snprintf(line + pos, sizeof(line) - pos, " %04X", pvBuf[i]);
+          if (pos >= (int)sizeof(line) - 8) break;
+        }
+        pos += snprintf(line + pos, sizeof(line) - pos, "\n");
+        serialLog(line);
+      }
+    }
+  }
+  // ---------------------------------------------------
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
@@ -520,6 +749,8 @@ void pollModbusOnce() {
   invPower = readScaledInt(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.invPower);
   battV    = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.battV);
   gridFreq = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.gridFreq);
+  battI    = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.battI);
+  battP    = readScaled(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.battP);
 
   inv.pvWork     = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.pvWork);
   inv.mppt       = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.mppt);
@@ -528,25 +759,6 @@ void pollModbusOnce() {
   inv.pvEnergyLo = (uint16_t)readRaw(pvBuf,  invCfg.pvBlockAddr,  invCfg.pvBlockLen,  invCfg.pvEnergyLo);
   inv.acChgHi    = (uint16_t)readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.acChgHi);
   inv.acChgLo    = (uint16_t)readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.acChgLo);
-
-  if (rawBattI == 0xFFFF) {
-    battI = 0.0f;
-  } else {
-    int16_t signedVal = (int16_t)rawBattI;
-    int32_t absVal    = absInt16(signedVal);
-    int32_t mp        = absInt16(invCfg.battCurrentAddr.maxPorog);
-    int16_t divt      = (mp > 0 && absVal > mp)
-                        ? invCfg.battCurrentAddr.divisortwo
-                        : invCfg.battCurrentAddr.divisor;
-    battI = (float)signedVal / (float)safeDivisor(divt);
-  }
-
-  if (rawBattP == 0xFFFF) {
-    battPower = 0.0f;
-  } else {
-    int16_t signedVal = (int16_t)rawBattP;
-    battPower = (float)signedVal / (float)safeDivisor(invCfg.battPowerAddr.divisor);
-  }
 
   if (!switch_state) {
     freePower = 0;
@@ -629,7 +841,7 @@ void pollModbusOnce() {
            "battV=%.1f battI=%.1f battPwr=%.0f pvP=%d invP=%d free=%d cur=%d pph=%d "
            "hVA=%u hpct=%d out=%d%% sw=%d msg=%s\n",
            millis(), inv.workState, pvV, pvI, systemV, invV, invI, gridFreq,
-           battV, battI, battPower, (int)pvPower, (int)invPower, (int)freePower,
+           battV, battI, battP, (int)pvPower, (int)invPower, (int)freePower,
            (int)currentPower, (int)PpowerHeater, (unsigned)cfgHeaterPowerVA,
            (int)currentHeaterPercent, (int)currentTriacDuty,
            switch_state ? 1 : 0, targMessage);
@@ -847,7 +1059,7 @@ let battIEl=document.getElementById("battI");
 battIEl.innerText=d.battI.toFixed(1)+" A";
 battIEl.className="value "+(d.battI>=0?"blue":"red");
 let battPwrEl=document.getElementById("battPwr");
-if(!isBad(d.battPower)){battPwrEl.innerText=Math.round(d.battPower)+" VA";battPwrEl.className="value "+(d.battPower>=0?"blue":"red");}
+if(!isBad(d.battP)){battPwrEl.innerText=Math.round(d.battP)+" VA";battPwrEl.className="value "+(d.battP>=0?"blue":"red");}
 else{battPwrEl.innerText="--";battPwrEl.className="value blue";}
 document.getElementById("accChg").innerText=fmtKwh(d.acChgHi,d.acChgLo);
 document.getElementById("curP").innerText=fmt0(d.cp,"VA");document.getElementById("freeP").innerText=fmt0(d.fp,"VA");
@@ -886,16 +1098,63 @@ h1{color:#00ff88;text-align:center;font-size:18px}
 <div class="ctr">
 <button class="btn" onclick="fetchLog()">Refresh</button>
 <button class="btn bg" onclick="document.getElementById('log').innerText=''">Clear</button>
-<button class="btn bg" onclick="autoScroll=!autoScroll;this.innerText=autoScroll?'Auto-scroll: ON':'Auto-scroll: OFF'">Auto-scroll: ON</button>
+<button class="btn bg" id="autoBtn" onclick="toggleAutoScroll()">Auto-scroll: ON</button>
+<button class="btn bg" id="dumpBtn" onclick="toggleDump()">Dump: OFF</button>
 <button class="btn bg" onclick="location.href='/'">Back</button>
 </div>
 <div id="log">Loading...</div>
 <script>
-let autoScroll=true;
+let autoScroll = true;
+let dumpOn = false;
+
+function toggleAutoScroll(){
+  autoScroll = !autoScroll;
+  let b = document.getElementById("autoBtn");
+  b.innerText = autoScroll ? "Auto-scroll: ON" : "Auto-scroll: OFF";
+}
+
+function updateDumpBtn(){
+  let b = document.getElementById("dumpBtn");
+  if(!b) return;
+  b.innerText = dumpOn ? "Dump: ON" : "Dump: OFF";
+  b.style.background = dumpOn ? "#00ff88" : "#555";
+  b.style.color = dumpOn ? "#000" : "#fff";
+}
+
+async function loadDumpState(){
+  try{
+    let r = await fetch("/api_dump");
+    let d = await r.json();
+    dumpOn = (d.dump === 1);
+  }catch(e){}
+  updateDumpBtn();
+}
+
+async function toggleDump(){
+  dumpOn = !dumpOn;
+  try{
+    let r = await fetch("/api_dump?state=" + (dumpOn ? "1" : "0"));
+    let d = await r.json();
+    dumpOn = (d.dump === 1);
+  }catch(e){}
+  updateDumpBtn();
+}
+
 async function fetchLog(){
-try{let r=await fetch("/api_serial");let t=await r.text();let el=document.getElementById("log");
-el.innerText=t;if(autoScroll)el.scrollTop=el.scrollHeight;}catch(e){document.getElementById("log").innerText="Error: "+e}}
-fetchLog();setInterval(fetchLog,2000);
+  try{
+    let r = await fetch("/api_serial");
+    let t = await r.text();
+    let el = document.getElementById("log");
+    el.innerText = t;
+    if(autoScroll) el.scrollTop = el.scrollHeight;
+  }catch(e){
+    document.getElementById("log").innerText = "Error: " + e;
+  }
+}
+
+loadDumpState();
+fetchLog();
+setInterval(fetchLog, 2000);
 </script></body></html>
 )rawliteral";
 
@@ -1162,7 +1421,7 @@ void setupWebServer() {
     doc["systemV"] = systemV;
     doc["invV"] = invV; doc["invI"] = invI;
     doc["invPower"] = (int)invPower;
-    doc["battV"] = battV; doc["battI"] = battI; doc["battPower"] = battPower;
+    doc["battV"] = battV; doc["battI"] = battI; doc["battP"] = battP;
     doc["freq"] = gridFreq;
     doc["pvEnergyHi"] = (unsigned)inv.pvEnergyHi;
     doc["pvEnergyLo"] = (unsigned)inv.pvEnergyLo;
@@ -1204,6 +1463,16 @@ void setupWebServer() {
   });
 
   server.on("/serial", HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", SERIAL_HTML); });
+
+  server.on("/api_dump", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (r->hasParam("state")) {
+      String v = r->getParam("state")->value();
+      dumpEnabled = (v == "1");
+    }
+    auto* res = r->beginResponseStream("application/json");
+    res->printf("{\"dump\":%d}", dumpEnabled ? 1 : 0);
+    r->send(res);
+  });
 
   server.on("/api_serial", HTTP_GET, [](AsyncWebServerRequest *r) {
     auto* res = r->beginResponseStream("text/plain; charset=utf-8");
@@ -1353,16 +1622,16 @@ void setupWebServer() {
 }
 
 // ========================================================================
-// Расшифровка кодов статуса ModbusMaster (реальные константы библиотеки)
+// Расшифровка кодов статуса (совместимо с ModbusMaster)
 // ========================================================================
 const char* mbErrStr(uint8_t st) {
   switch (st) {
-    case 0x00: return "SUCCESS";
-    case 0xE0: return "INVALID_SLAVE_ID";
-    case 0xE1: return "INVALID_FUNCTION";   // также Modbus exception
-    case 0xE2: return "RESPONSE_TIMEOUT";
-    case 0xE3: return "INVALID_CRC";
-    default:   return "UNKNOWN";
+    case MB_SUCCESS:          return "SUCCESS";
+    case MB_INVALID_SLAVE_ID: return "INVALID_SLAVE_ID";
+    case MB_INVALID_FUNCTION: return "INVALID_FUNCTION";
+    case MB_RESPONSE_TIMEOUT: return "RESPONSE_TIMEOUT";
+    case MB_INVALID_CRC:      return "INVALID_CRC";
+    default:                  return "UNKNOWN";
   }
 }
 
@@ -1403,7 +1672,7 @@ void setup() {
   xTaskCreatePinnedToCore(triacTask,  "triacTask",  2048, nullptr, 2, &triacTaskHandle,  0);
   xTaskCreatePinnedToCore(modbusTask, "modbusTask", 4096, nullptr, 1, &modbusTaskHandle, 0);
 
-  serialLog("=== System started (Burst Control v7.2.4) ===\n");
+  serialLog("=== System started (Burst Control v7.2.4, raw Modbus) ===\n");
 }
 
 void loop() {
@@ -1439,34 +1708,26 @@ void loop() {
 
       // ---- RESET 1 ----
       if (invCfg.resetCounter1Addr > 0) {
-        uint8_t st = 0xEE;
+        uint8_t excCode = 0;
+        uint8_t st = modbusWriteSingle(invCfg.resetCounter1Addr, 1, &excCode);
 
-        // Попытка 1: writeSingleRegister (0x06), val=1
-        node.clearResponseBuffer();
-        st = node.writeSingleRegister(invCfg.resetCounter1Addr, 1);
-
-        // Попытка 2: writeMultipleRegisters (0x10), val=1
-        if (st != node.ku8MBSuccess) {
+        if (st != MB_SUCCESS) {
           vTaskDelay(pdMS_TO_TICKS(100));
-          node.clearResponseBuffer();
-          node.setTransmitBuffer(0, 1);
-          st = node.writeMultipleRegisters(invCfg.resetCounter1Addr, 1);
+          uint16_t v1 = 1;
+          st = modbusWriteMultiple(invCfg.resetCounter1Addr, &v1, 1, &excCode);
         }
 
-        // Попытка 3: writeMultipleRegisters (0x10), val=0
-        if (st != node.ku8MBSuccess) {
+        if (st != MB_SUCCESS) {
           vTaskDelay(pdMS_TO_TICKS(100));
-          node.clearResponseBuffer();
-          node.setTransmitBuffer(0, 0);
-          st = node.writeMultipleRegisters(invCfg.resetCounter1Addr, 1);
+          uint16_t v0 = 0;
+          st = modbusWriteMultiple(invCfg.resetCounter1Addr, &v0, 1, &excCode);
         }
 
         char l[192];
-        if (st == node.ku8MBInvalidFunction) {
-          uint16_t exc = node.getResponseBuffer(0);
+        if (st == MB_INVALID_FUNCTION) {
           snprintf(l, sizeof(l),
                    ">>> RESET1 0x%04X status=EXCEPTION exc=0x%02X\n",
-                   invCfg.resetCounter1Addr, exc);
+                   invCfg.resetCounter1Addr, excCode);
         } else {
           snprintf(l, sizeof(l),
                    ">>> RESET1 0x%04X final_status=0x%02X (%s)\n",
@@ -1478,8 +1739,8 @@ void loop() {
 
       // ---- RESET 2 ----
       if (invCfg.resetCounter2Addr > 0) {
-        node.clearResponseBuffer();
-        uint8_t st = node.writeSingleRegister(invCfg.resetCounter2Addr, 1);
+        uint8_t excCode = 0;
+        uint8_t st = modbusWriteSingle(invCfg.resetCounter2Addr, 1, &excCode);
 
         char l[192];
         snprintf(l, sizeof(l),
