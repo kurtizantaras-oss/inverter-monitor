@@ -11,7 +11,7 @@
 #define TX2_PIN 17
 #define RS485_CTRL 4
 #define LED_PIN 2
-#define SKETCH_VERSION "7.2.4"
+#define SKETCH_VERSION "7.2.5"
 #define SERIAL_BUF_SIZE 4096
 
 // ========================================================================
@@ -51,6 +51,7 @@ float cfgBattHysteresisV = 0.5f;
 float cfgBattOffCurrent = 0.00f;
 float cfgFullChargeCurrentA = 0.00f;
 float cfgFullChargeVoltage = 29.00f;
+float cfgBattDischargeAllowW = 0.00f;
 
 float battV = 0.00f;
 float pvV = 0.00f;
@@ -188,7 +189,7 @@ const int NUM_INVERTER_MODELS = sizeof(inverterConfigs) / sizeof(inverterConfigs
 int cfgInverterModelIdx = 0;
 
 // ========================================================================
-// RAW MODBUS RTU — замість бібліотеки ModbusMaster
+// RAW MODBUS RTU
 // ========================================================================
 #define MB_SUCCESS           0x00
 #define MB_INVALID_SLAVE_ID  0xE0
@@ -216,7 +217,6 @@ static void mbFlushRx() {
   while (Serial1.available()) Serial1.read();
 }
 
-// --- Функція 0x03: читання holding-регістрів ---
 static uint8_t modbusReadHolding(uint16_t addr, uint8_t qty,
                                  uint16_t* outRegs,
                                  uint32_t timeoutMs = 1500) {
@@ -280,7 +280,6 @@ static uint8_t modbusReadHolding(uint16_t addr, uint8_t qty,
   return MB_SUCCESS;
 }
 
-// --- Функція 0x06: запис одного регістра ---
 static uint8_t modbusWriteSingle(uint16_t addr, uint16_t value,
                                  uint8_t* excCode = nullptr,
                                  uint32_t timeoutMs = 1500) {
@@ -334,7 +333,6 @@ static uint8_t modbusWriteSingle(uint16_t addr, uint16_t value,
   return MB_SUCCESS;
 }
 
-// --- Функція 0x10: запис кількох регістрів ---
 static uint8_t modbusWriteMultiple(uint16_t addr, const uint16_t* values, uint8_t qty,
                                    uint8_t* excCode = nullptr,
                                    uint32_t timeoutMs = 1500) {
@@ -434,7 +432,7 @@ float readScaled(const uint16_t* buf, uint16_t blockAddr, uint8_t blockLen, cons
   int16_t divt = (mp > 0 && absVal > mp) ? r.divisortwo : r.divisor;
 
   float v = (float)raw / (float)safeDivisor(divt);
-  if (v == 0.0f) v = 0.0f;   // -0.0 → +0.0
+  if (v == 0.0f) v = 0.0f;
   return v;
 }
 
@@ -517,7 +515,6 @@ unsigned long lastWifiReconnectMs = 0;
 bool needRestart = false;
 unsigned long restartRequestedMs = 0;
 
-// Обгортки над сирим Modbus для сумісності з рештою коду
 template<typename T>
 bool readModbusBlock(uint16_t addr, uint8_t qty, T* buf) {
   if (addr == 0 || qty == 0) return false;
@@ -546,15 +543,16 @@ void loadSettings() {
   cfgInverterModelIdx = preferences.getInt("invModel", 0);
   if (cfgInverterModelIdx < 0 || cfgInverterModelIdx >= NUM_INVERTER_MODELS) cfgInverterModelIdx = 0;
 
-  cfgHeaterPowerVA      = preferences.getUShort("heaterVA",  100);
-  cfgMaxAllocatedVA     = preferences.getUShort("maxAllocVA", 100);
-  cfgUpdateIntervalSec  = constrain(preferences.getFloat("updIntSec", DEFAULT_UPDATE_INTERVAL_SEC), 0.5f, 10.0f);
-  cfgBattOffVoltage     = constrain(preferences.getFloat("battOffV", 27.0f), 20.0f, 80.0f);
-  cfgBattHysteresisV    = constrain(preferences.getFloat("battHystV", 0.5f), 0.0f, 10.0f);
-  cfgBattOffCurrent     = constrain(preferences.getFloat("battOffI", 0.0f), -100.0f, 100.0f);
-  cfgFullChargeCurrentA = constrain(preferences.getFloat("chgCurA", 0.0f), -100.0f, 100.0f);
-  cfgFullChargeVoltage  = constrain(preferences.getFloat("fullChgV", 29.0f), 20.0f, 80.0f);
-  switch_state          = preferences.getBool("swState", false);
+  cfgHeaterPowerVA        = preferences.getUShort("heaterVA",  100);
+  cfgMaxAllocatedVA       = preferences.getUShort("maxAllocVA", 100);
+  cfgUpdateIntervalSec    = constrain(preferences.getFloat("updIntSec", DEFAULT_UPDATE_INTERVAL_SEC), 0.5f, 10.0f);
+  cfgBattOffVoltage       = constrain(preferences.getFloat("battOffV", 27.0f), 20.0f, 80.0f);
+  cfgBattHysteresisV      = constrain(preferences.getFloat("battHystV", 0.5f), 0.0f, 10.0f);
+  cfgBattOffCurrent       = constrain(preferences.getFloat("battOffI", 0.0f), -100.0f, 100.0f);
+  cfgFullChargeCurrentA   = constrain(preferences.getFloat("chgCurA", 0.0f), -100.0f, 100.0f);
+  cfgFullChargeVoltage    = constrain(preferences.getFloat("fullChgV", 29.0f), 20.0f, 80.0f);
+  cfgBattDischargeAllowW  = constrain(preferences.getFloat("battDisW", 0.0f), 0.0f, 15000.0f);
+  switch_state            = preferences.getBool("swState", false);
   preferences.end();
 }
 
@@ -569,6 +567,7 @@ void saveSettings() {
   preferences.putFloat("battOffI", cfgBattOffCurrent);
   preferences.putFloat("chgCurA", cfgFullChargeCurrentA);
   preferences.putFloat("fullChgV", cfgFullChargeVoltage);
+  preferences.putFloat("battDisW", cfgBattDischargeAllowW);
   preferences.putBool("swState", switch_state);
   preferences.end();
 }
@@ -685,11 +684,9 @@ void pollModbusOnce() {
     return;
   }
 
-  // ---- ДАМП (керується кнопкою в Serial Monitor) ----
   if (dumpEnabled) {
     char line[256];
 
-    // inv-блок
     if (invCfg.invBlockLen > 0) {
       int n = invCfg.invBlockLen;
       for (int row = 0; row < n; row += 8) {
@@ -704,7 +701,6 @@ void pollModbusOnce() {
       }
     }
 
-    // pv-блок
     if (invCfg.pvBlockLen > 0) {
       int n = invCfg.pvBlockLen;
       for (int row = 0; row < n; row += 8) {
@@ -719,7 +715,6 @@ void pollModbusOnce() {
       }
     }
   }
-  // ---------------------------------------------------
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
@@ -768,6 +763,7 @@ void pollModbusOnce() {
     if (cfgFullChargeCurrentA > 0.0f && battV < cfgFullChargeVoltage) {
       freePower -= (int32_t)(battV * cfgFullChargeCurrentA);
     }
+    freePower += (int32_t)cfgBattDischargeAllowW;
   }
 
   static bool isBattLow = false;
@@ -1165,8 +1161,9 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 body{background:#0f0f0f;color:#e6e6e6;font-family:monospace;padding:15px;margin:0}
 h1{color:#00ff88;text-align:center;font-size:18px}h2{color:#4da3ff;font-size:14px;margin-top:20px}
 .card{background:#1c1c1c;border-radius:10px;padding:15px;margin:10px 0}
-label{color:#888;font-size:12px;display:block;margin-top:10px}
-.desc{color:#666;font-size:10px;margin:2px 0 6px 0;line-height:1.3}
+label{color:#ccc;font-size:13px;font-weight:bold;display:block;margin-top:14px}
+.desc{color:#888;font-size:11px;margin:4px 0 8px 0;line-height:1.5;background:#141414;padding:8px 10px;border-left:3px solid #4da3ff;border-radius:3px}
+.hint{color:#ffd166;font-size:10px;margin:2px 0 6px 0;line-height:1.4;font-style:italic}
 input, select{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;background:#333;color:#fff;border:1px solid #555;border-radius:6px;font-size:14px}
 .btn{background:#00ff88;color:#000;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-weight:bold;margin:5px}
 .bg{background:#555;color:#fff}.msg{color:#00ff88;text-align:center;margin:10px 0;display:none}
@@ -1177,32 +1174,63 @@ input, select{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;backgro
 
 <h2>Тип інвертора</h2><div class="card">
 <label>Модель інвертора</label>
-<div class="desc">Оберіть модель для правильного читання регістрів Modbus.</div>
+<div class="desc">Оберіть модель вашого інвертора. Від цього залежить, за якими адресами Modbus читатимуться напруги, струми, потужності та лічильники енергії. Якщо обрано неправильну модель — дані будуть некоректними або нульовими.</div>
+<div class="hint">Доступні моделі: SRNE / Must / EASUN — повна підтримка. Growatt, Voltronic / Axpert — заготовки (потребують заповнення адрес).</div>
 <select id="invModel"></select>
 </div>
 
 <h2>General</h2><div class="card">
-<label>Heater power (VA)</label><div class="desc">Номінальна потужність ТЕНа у ВА. Мінімум 100. Від цього залежить % навантаження.</div>
-<input type="number" id="heaterVA" min="100" max="10000" value="1000">
-<label>Max allocated power (VA)</label><div class="desc">Максимальна потужність у ВА. Запобігає перевантаженню.</div>
-<input type="number" id="maxAllocVA" min="100" max="10000" value="500">
-<label>Update interval (sec)</label><div class="desc">Інтервал опитування Modbus (рек. 1-3 сек).</div>
+<label>Heater power (VA)</label>
+<div class="desc">Номінальна потужність вашого ТЕНа (нагрівача) у вольт-амперах. Від цього значення залежить відсоток навантаження: якщо виділена потужність 250 ВА, а ТЕН на 1000 ВА — буде показано 25%. Якщо вказати завищене значення, ТЕН ніколи не вийде на 100%, якщо занижене — регулювання буде грубим.</div>
+<div class="hint">Приклад: ТЕН 1 кВт → вкажіть 1000. ТЕН 500 Вт → вкажіть 500.</div>
+<input type="number" id="heaterVA" min="100" max="15000" value="1000">
+
+<label>Max allocated power (VA)</label>
+<div class="desc">Максимальна потужність, яку система дозволяє віддати на ТЕН. Це «стеля» регулювання — потужність ніколи не перевищить це значення, навіть якщо є надлишок енергії. Захищає інвертор і акумулятор від перевантаження.</div>
+<div class="hint">Має бути ≤ номіналу інвертора. Для інвертора 1 кВт розумно ставити 500–800 ВА.</div>
+<input type="number" id="maxAllocVA" min="100" max="15000" value="500">
+
+<label>Update interval (sec)</label>
+<div class="desc">Як часто ESP32 опитує інвертор через Modbus. Менший інтервал — швидша реакція на зміну сонця чи навантаження, але більше навантаження на шину RS-485. Занадто малий інтервал може спричинити помилки CRC або таймаути.</div>
+<div class="hint">Рекомендовано: 1.0–3.0 сек. Мінімум 0.5, максимум 10.</div>
 <input type="number" id="updIntSec" min="0.5" max="10" step="0.1" value="2">
 </div>
+
 <h2>Load shutdown</h2><div class="card">
-<label>Shutdown voltage (V)</label><div class="desc">Критична напруга для вимкнення навантаження.</div>
-<input type="number" id="battOffV" min="20" max="80" step="0.1" value="27">
-<label>Hysteresis (V)</label><div class="desc">Різниця між вимкненням і повторним вмиканням.</div>
+<label>Hysteresis (V)</label>
+<div class="desc">Гістерезис — різниця між порогом вимкнення і порогом повторного вмикання. Запобігає «блиманню» реле, коли напруга коливається біля порогу. Наприклад, при shutdown=27 В і hysteresis=0.5 В: вимкнеться при 27.0 В, увімкнеться назад лише при 27.5 В.</div>
+<div class="hint">Рекомендовано: 0.3–1.0 В. Менше — швидше реакція, але більше «блимання».</div>
 <input type="number" id="battHystV" min="0" max="5" step="0.1" value="0.5">
-<label>Shutdown current (A)</label><div class="desc">Мінімальний струм акумулятора для роботи навантаження.</div>
+
+<label>Shutdown voltage (V)</label>
+<div class="desc">Критична напруга акумулятора, при якій навантаження (ТЕН) вимикається повністю, щоб запобігти глибокому розряду та пошкодженню батареї. Поки напруга нижче цього порогу — ТЕН не вмикається, навіть якщо є надлишок сонця.</div>
+<div class="hint">Для 24 В свинцево-кислотної АКБ — 24.0–25.0 В. Для 48 В — 48.0–50.0 В. Для LiFePO4 — вище (напр. 25.5 для 24 В).</div>
+<input type="number" id="battOffV" min="20" max="80" step="0.1" value="27">
+
+<label>Shutdown current (A)</label>
+<div class="desc">Мінімальний струм акумулятора, нижче якого навантаження вимикається. Умова спрацьовує, якщо <b>battI &lt; це значення</b>. Може бути від'ємним: тоді поріг означає «дозволити розряд до -N ампер». Наприклад, при значенні -5 А ТЕН вимкнеться лише коли струм батареї стане меншим за -5 А (глибокий розряд).</div>
+<div class="hint">0 = вимикати при будь-якому розряді. -10 = дозволити розряд до 10 А. +5 = працювати лише коли АКБ заряджається ≥ 5 А.</div>
 <input type="number" id="battOffI" min="-100" max="100" step="1" value="0">
 </div>
+
 <h2>Battery charging</h2><div class="card">
-<label>Charge current (A)</label><div class="desc">Струм, що резервується для зарядки акумулятора. Може бути від'ємним.</div>
-<input type="number" id="chgCurA" min="-100" max="100" step="1" value="0">
-<label>Full charge voltage (V)</label><div class="desc">Напруга повного заряду, після якої резервування припиняється.</div>
+<label>Full charge voltage (V)</label>
+<div class="desc">Напруга повного заряду АКБ. Коли напруга батареї досягає цього значення — резервування струму зарядки (поле вище) припиняється, і вся надлишкова потужність іде на ТЕН. Це дозволяє використати надлишок, коли АКБ вже повністю заряджена.</div>
+<div class="hint">Приклад: 28.8 В для свинцево-кислотної 24 В, 29.2 В для LiFePO4 24 В.</div>
 <input type="number" id="fullChgV" min="20" max="80" step="1" value="29">
+
+<label>Charge current (A)</label>
+<div class="desc">Струм, який резервується для зарядки акумулятора. Додатне значення — скільки ампер «забронювати» для АКБ перед тим, як решта піде на ТЕН. Від'ємне значення — навпаки, додає бюджет ТЕНу: фактично дозволяє розряджати АКБ цим струмом на нагрів.</div>
+<div class="hint">Приклад: +10 = зарезервувати 10 А на заряд АКБ. -5 = дозволити ТЕНу брати 5 А з АКБ. 0 = не резервувати й не розряджати.</div>
+<input type="number" id="chgCurA" min="-100" max="100" step="1" value="0">
+
+<label>Battery discharge allow (W)</label>
+<div class="desc">Дозвіл брати енергію з акумулятора на ТЕН. За замовчуванням 0 — ТЕН працює лише на надлишок сонця, АКБ не розряджається. Якщо вказати, наприклад, 300 Вт — система дозволить ТЕНу споживати до 300 Вт з АКБ понад те, що дає сонце. Це дозволяє утилізувати запас батареї для нагріву.</div>
+<div class="hint">Обережно: великі значення швидко розряджають АКБ. Захист «Shutdown voltage» і «Shutdown current» продовжують діяти.</div>
+<div class="hint">УВАГА: якщо ви встановлюєте це значення — ОБОВ'ЯЗКОВО ЗМЕНШІТЬ значення полів <b>Charge current (A)</b> та <b>Shutdown current (A)</b> на величину розрахованого струму. Розрахунок: Battery discharge allow (W) / напруга АКБ = струм розряду (A). Для 24 В: 240 W / 24 V = 10 A; 480 W / 24 V = 20 A. Для 48 В: 240 W / 48 V = 5 A; 480 W / 48 V = 10 A.</div>
+<input type="number" id="battDisW" min="0" max="15000" step="50" value="0">
 </div>
+
 <div style="text-align:center;margin-top:15px">
 <button class="btn" onclick="save()">Save</button>
 <button class="btn bg" onclick="location.href='/'">Back</button>
@@ -1211,7 +1239,7 @@ input, select{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;backgro
 async function load(){
   try{
     let d=await(await fetch("/api_settings")).json();
-    ["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","battOffI","chgCurA","fullChgV"].forEach(k=>document.getElementById(k).value=d[k]);
+    ["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","battOffI","chgCurA","fullChgV","battDisW"].forEach(k=>document.getElementById(k).value=d[k]);
     let invSelect = document.getElementById("invModel");
     invSelect.innerHTML = "";
     if (d.models) {
@@ -1225,7 +1253,7 @@ async function load(){
   }catch(e){}
 }
 async function save(){
-let body=["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","battOffI","chgCurA","fullChgV","invModel"].map(k=>k+"="+document.getElementById(k).value).join("&");
+let body=["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","battOffI","chgCurA","fullChgV","battDisW","invModel"].map(k=>k+"="+document.getElementById(k).value).join("&");
 try{let resp=await fetch("/save_settings",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});
 if(resp.status==200){document.getElementById("msg").style.display="block";document.getElementById("err").style.display="none";setTimeout(()=>document.getElementById("msg").style.display="none",2000);}
 else if(resp.status==403){document.getElementById("err").style.display="block";document.getElementById("msg").style.display="none";setTimeout(()=>document.getElementById("err").style.display="none",3000);}
@@ -1451,6 +1479,7 @@ void setupWebServer() {
     doc["battOffI"] = cfgBattOffCurrent;
     doc["chgCurA"] = cfgFullChargeCurrentA;
     doc["fullChgV"] = cfgFullChargeVoltage;
+    doc["battDisW"] = cfgBattDischargeAllowW;
     JsonArray models = doc.createNestedArray("models");
     for (int i = 0; i < NUM_INVERTER_MODELS; i++) {
       JsonObject m = models.createNestedObject();
@@ -1535,6 +1564,7 @@ void setupWebServer() {
       float    newBattOffI   = cfgBattOffCurrent;
       float    newChgCurA    = cfgFullChargeCurrentA;
       float    newFullChgV   = cfgFullChargeVoltage;
+      float    newBattDisW   = cfgBattDischargeAllowW;
 
       if (req->hasParam("heaterVA",   true)) newHeaterVA   = constrain(req->getParam("heaterVA",   true)->value().toInt(),   100,   15000);
       if (req->hasParam("maxAllocVA", true)) newMaxAllocVA = constrain(req->getParam("maxAllocVA", true)->value().toInt(),   100,   15000);
@@ -1544,16 +1574,18 @@ void setupWebServer() {
       if (req->hasParam("battOffI",   true)) newBattOffI   = constrain(req->getParam("battOffI",   true)->value().toFloat(), -100.0f, 100.0f);
       if (req->hasParam("chgCurA",    true)) newChgCurA    = constrain(req->getParam("chgCurA",    true)->value().toFloat(), -100.0f, 100.0f);
       if (req->hasParam("fullChgV",   true)) newFullChgV   = constrain(req->getParam("fullChgV",   true)->value().toFloat(), 20.0f, 80.0f);
+      if (req->hasParam("battDisW",   true)) newBattDisW   = constrain(req->getParam("battDisW",   true)->value().toFloat(), 0.0f, 15000.0f);
 
       if (dataMutex && xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-        cfgHeaterPowerVA      = newHeaterVA;
-        cfgMaxAllocatedVA     = newMaxAllocVA;
-        cfgUpdateIntervalSec  = newUpdInt;
-        cfgBattOffVoltage     = newBattOffV;
-        cfgBattHysteresisV    = newBattHystV;
-        cfgBattOffCurrent     = newBattOffI;
-        cfgFullChargeCurrentA = newChgCurA;
-        cfgFullChargeVoltage  = newFullChgV;
+        cfgHeaterPowerVA        = newHeaterVA;
+        cfgMaxAllocatedVA       = newMaxAllocVA;
+        cfgUpdateIntervalSec    = newUpdInt;
+        cfgBattOffVoltage       = newBattOffV;
+        cfgBattHysteresisV      = newBattHystV;
+        cfgBattOffCurrent       = newBattOffI;
+        cfgFullChargeCurrentA   = newChgCurA;
+        cfgFullChargeVoltage    = newFullChgV;
+        cfgBattDischargeAllowW  = newBattDisW;
         xSemaphoreGive(dataMutex);
       }
 
@@ -1622,7 +1654,7 @@ void setupWebServer() {
 }
 
 // ========================================================================
-// Расшифровка кодов статуса (совместимо с ModbusMaster)
+// Расшифровка кодов статуса
 // ========================================================================
 const char* mbErrStr(uint8_t st) {
   switch (st) {
@@ -1672,7 +1704,7 @@ void setup() {
   xTaskCreatePinnedToCore(triacTask,  "triacTask",  2048, nullptr, 2, &triacTaskHandle,  0);
   xTaskCreatePinnedToCore(modbusTask, "modbusTask", 4096, nullptr, 1, &modbusTaskHandle, 0);
 
-  serialLog("=== System started (Burst Control v7.2.4, raw Modbus) ===\n");
+  serialLog("=== System started (Burst Control v7.2.5, raw Modbus) ===\n");
 }
 
 void loop() {
@@ -1696,17 +1728,12 @@ void loop() {
     WiFi.reconnect();
   }
 
-  // ========================================================================
-  // СБРОС СЧЁТЧИКОВ — fallback 0x06(val=1) → 0x10(val=1) → 0x10(val=0)
-  // Регистр 20213 у SRNE/Must часто принимает только 0x10 или только val=0.
-  // ========================================================================
   if (pendingCounterReset) {
     pendingCounterReset = false;
 
     if (xSemaphoreTake(modbusMutex, portMAX_DELAY) == pdTRUE) {
       const InverterConfig& invCfg = inverterConfigs[cfgInverterModelIdx];
 
-      // ---- RESET 1 ----
       if (invCfg.resetCounter1Addr > 0) {
         uint8_t excCode = 0;
         uint8_t st = modbusWriteSingle(invCfg.resetCounter1Addr, 1, &excCode);
@@ -1737,7 +1764,6 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(150));
       }
 
-      // ---- RESET 2 ----
       if (invCfg.resetCounter2Addr > 0) {
         uint8_t excCode = 0;
         uint8_t st = modbusWriteSingle(invCfg.resetCounter2Addr, 1, &excCode);
