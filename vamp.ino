@@ -48,7 +48,6 @@ uint16_t cfgMaxAllocatedVA = 100;
 float cfgUpdateIntervalSec = DEFAULT_UPDATE_INTERVAL_SEC;
 float cfgBattOffVoltage = 27.00f;
 float cfgBattHysteresisV = 0.5f;
-float cfgBattOffCurrent = 0.00f;
 float cfgFullChargeCurrentA = 0.00f;
 float cfgFullChargeVoltage = 29.00f;
 float cfgBattDischargeAllowW = 0.00f;
@@ -163,9 +162,9 @@ const InverterConfig inverterConfigs[] = {
     .baudRate = 19200
   },
   {
-    .id = "GROWATT", 
+    .id = "GROWATT",
     .name = "Growatt (Заготовка)",
-        .invBlockAddr = 25201,
+    .invBlockAddr = 25201,
     .invBlockLen = 80,
     .pvBlockAddr  = 15201,
     .pvBlockLen  = 18,
@@ -537,10 +536,7 @@ void requireLocalIP(AsyncWebServerRequest *request, std::function<void(AsyncWebS
 // InverterData
 // ========================================================================
 struct InverterData {
-  uint16_t inv[80];
-  uint16_t pv[20];
   int workState = 0;
-  const char* stateStr = "OFF";
   String machineType, machinePower;
 
   uint16_t pvWork = 0;
@@ -595,7 +591,6 @@ void loadSettings() {
   cfgUpdateIntervalSec    = constrain(preferences.getFloat("updIntSec", DEFAULT_UPDATE_INTERVAL_SEC), 0.5f, 10.0f);
   cfgBattOffVoltage       = constrain(preferences.getFloat("battOffV", 27.0f), 20.0f, 80.0f);
   cfgBattHysteresisV      = constrain(preferences.getFloat("battHystV", 0.5f), 0.0f, 10.0f);
-  cfgBattOffCurrent       = constrain(preferences.getFloat("battOffI", 0.0f), -100.0f, 100.0f);
   cfgFullChargeCurrentA   = constrain(preferences.getFloat("chgCurA", 0.0f), -100.0f, 100.0f);
   cfgFullChargeVoltage    = constrain(preferences.getFloat("fullChgV", 29.0f), 20.0f, 80.0f);
   cfgBattDischargeAllowW  = constrain(preferences.getFloat("battDisW", 0.0f), 0.0f, 15000.0f);
@@ -611,7 +606,6 @@ void saveSettings() {
   preferences.putFloat("updIntSec", cfgUpdateIntervalSec);
   preferences.putFloat("battOffV", cfgBattOffVoltage);
   preferences.putFloat("battHystV", cfgBattHysteresisV);
-  preferences.putFloat("battOffI", cfgBattOffCurrent);
   preferences.putFloat("chgCurA", cfgFullChargeCurrentA);
   preferences.putFloat("fullChgV", cfgFullChargeVoltage);
   preferences.putFloat("battDisW", cfgBattDischargeAllowW);
@@ -699,7 +693,7 @@ void triacTask(void *pvParameters) {
       }
     }
 
-    vTaskDelayUntil(&lastWakeTime, period);
+    vTaskDelayUntil(&lastWakeTime, TRIAC_TICK_MS);
   }
 }
 
@@ -765,20 +759,7 @@ void pollModbusOnce() {
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
-  memcpy(inv.inv, invBuf, sizeof(inv.inv));
-  memcpy(inv.pv, pvBuf, sizeof(inv.pv));
-
   inv.workState = readRaw(invBuf, invCfg.invBlockAddr, invCfg.invBlockLen, invCfg.invWorkState);
-  switch (inv.workState) {
-    case 0: inv.stateStr = "POWER ON"; break;
-    case 1: inv.stateStr = "SELFTEST"; break;
-    case 2: inv.stateStr = "OFF GRID"; break;
-    case 3: inv.stateStr = "GRID TIE"; break;
-    case 4: inv.stateStr = "BYPASS"; break;
-    case 5: inv.stateStr = "STOP"; break;
-    case 6: inv.stateStr = "GRID CHRG"; break;
-    default: inv.stateStr = "UNKNOWN"; break;
-  }
 
   pvV      = readScaled(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.pvV);
   pvI      = readScaled(pvBuf, invCfg.pvBlockAddr, invCfg.pvBlockLen, invCfg.pvI);
@@ -811,6 +792,7 @@ void pollModbusOnce() {
       freePower -= (int32_t)(battV * cfgFullChargeCurrentA);
     }
     freePower += (int32_t)cfgBattDischargeAllowW;
+
   }
 
   static bool isBattLow = false;
@@ -842,10 +824,15 @@ void pollModbusOnce() {
     freePower = 0;
     targMessage = "Недостатньо потужності";
   }
-  else if (battI < cfgBattOffCurrent && battV < cfgFullChargeVoltage) {
+  else if (battI < cfgFullChargeCurrentA && battV < cfgFullChargeVoltage) {
+    // Струм АКБ нижче мінімуму — не відключаємо, а зменшуємо потужність ТЕНа,
+    // щоб дати батареї більше заряду. Крок пропорційний дефіциту струму.
+    int32_t deficitW = (int32_t)((cfgFullChargeCurrentA - battI) * battV);
+    if (deficitW < cfgMaxAllocatedVA / 20) deficitW = cfgMaxAllocatedVA / 20;   // мінімальний крок, щоб гарантовано зменшити
+    currentPower -= deficitW;
+    if (currentPower < 0) currentPower = 0;
     freePower = 0;
-    currentPower = 0;
-    targMessage = "Струм акумулятора менше встановленого мінімуму";
+    targMessage = "Струм акумулятора менше мінімуму — зменшую потужність на 5% від потужності.";
   }
   else if (freePower == 0) {
     targMessage = "Потужність на максимумі";
@@ -855,10 +842,10 @@ void pollModbusOnce() {
       currentPower = cfgMaxAllocatedVA;
       targMessage = "Потужність обрізано до максимуму";
     }
-    else if (freePower > cfgMaxAllocatedVA / 10) {
-      currentPower += cfgMaxAllocatedVA / 10;
+    else if (freePower > cfgMaxAllocatedVA / 20) {
+      currentPower += cfgMaxAllocatedVA / 20;
       if (currentPower > cfgMaxAllocatedVA) currentPower = cfgMaxAllocatedVA;
-      targMessage = "Потужність збільшена на 0.1 від потужності";
+      targMessage = "Потужність збільшена на 5% від потужності";
     }
     else {
       currentPower += freePower;
@@ -1254,12 +1241,6 @@ input, select{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;backgro
 <div class="hint">Для 24 В свинцево-кислотної АКБ — 24.0–25.0 В. Для 48 В — 48.0–50.0 В. Для LiFePO4 — вище (напр. 25.5 для 24 В).</div>
 <input type="number" id="battOffV" min="20" max="80" step="0.1" value="27">
 
-<label>Shutdown current (A)</label>
-<div class="desc">Мінімальний струм акумулятора, нижче якого навантаження вимикається. Умова спрацьовує, якщо <b>battI &lt; це значення</b>. Може бути від'ємним: тоді поріг означає «дозволити розряд до -N ампер». Наприклад, при значенні -5 А ТЕН вимкнеться лише коли струм батареї стане меншим за -5 А (глибокий розряд).</div>
-<div class="hint">0 = вимикати при будь-якому розряді. -10 = дозволити розряд до 10 А. +5 = працювати лише коли АКБ заряджається ≥ 5 А.</div>
-<input type="number" id="battOffI" min="-100" max="100" step="1" value="0">
-</div>
-
 <h2>Battery charging</h2><div class="card">
 <label>Full charge voltage (V)</label>
 <div class="desc">Напруга повного заряду АКБ. Коли напруга батареї досягає цього значення — резервування струму зарядки (поле вище) припиняється, і вся надлишкова потужність іде на ТЕН. Це дозволяє використати надлишок, коли АКБ вже повністю заряджена.</div>
@@ -1274,7 +1255,7 @@ input, select{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;backgro
 <label>Battery discharge allow (W)</label>
 <div class="desc">Дозвіл брати енергію з акумулятора на ТЕН. За замовчуванням 0 — ТЕН працює лише на надлишок сонця, АКБ не розряджається. Якщо вказати, наприклад, 300 Вт — система дозволить ТЕНу споживати до 300 Вт з АКБ понад те, що дає сонце. Це дозволяє утилізувати запас батареї для нагріву.</div>
 <div class="hint">Обережно: великі значення швидко розряджають АКБ. Захист «Shutdown voltage» і «Shutdown current» продовжують діяти.</div>
-<div class="hint">УВАГА: якщо ви встановлюєте це значення — ОБОВ'ЯЗКОВО ЗМЕНШІТЬ значення полів <b>Charge current (A)</b> та <b>Shutdown current (A)</b> на величину розрахованого струму. Розрахунок: Battery discharge allow (W) / напруга АКБ = струм розряду (A). Для 24 В: 240 W / 24 V = 10 A; 480 W / 24 V = 20 A. Для 48 В: 240 W / 48 V = 5 A; 480 W / 48 V = 10 A.</div>
+<div class="hint">УВАГА: якщо ви встановлюєте це значення — ОБОВ'ЯЗКОВО ЗМЕНШІТЬ значення поля <b>Charge current (A)</b> на величину розрахованого струму. Розрахунок: Battery discharge allow (W) / напруга АКБ = струм розряду (A). Для 24 В: 240 W / 24 V = 10 A; 480 W / 24 V = 20 A. Для 48 В: 240 W / 48 V = 5 A; 480 W / 48 V = 10 A.</div>
 <input type="number" id="battDisW" min="0" max="15000" step="50" value="0">
 </div>
 
@@ -1286,7 +1267,7 @@ input, select{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;backgro
 async function load(){
   try{
     let d=await(await fetch("/api_settings")).json();
-    ["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","battOffI","chgCurA","fullChgV","battDisW"].forEach(k=>document.getElementById(k).value=d[k]);
+    ["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","chgCurA","fullChgV","battDisW"].forEach(k=>document.getElementById(k).value=d[k]);
     let invSelect = document.getElementById("invModel");
     invSelect.innerHTML = "";
     if (d.models) {
@@ -1300,7 +1281,7 @@ async function load(){
   }catch(e){}
 }
 async function save(){
-let body=["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","battOffI","chgCurA","fullChgV","battDisW","invModel"].map(k=>k+"="+document.getElementById(k).value).join("&");
+let body=["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","chgCurA","fullChgV","battDisW","invModel"].map(k=>k+"="+document.getElementById(k).value).join("&");
 try{let resp=await fetch("/save_settings",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});
 if(resp.status==200){document.getElementById("msg").style.display="block";document.getElementById("err").style.display="none";setTimeout(()=>document.getElementById("msg").style.display="none",2000);}
 else if(resp.status==403){document.getElementById("err").style.display="block";document.getElementById("msg").style.display="none";setTimeout(()=>document.getElementById("err").style.display="none",3000);}
@@ -1523,7 +1504,6 @@ void setupWebServer() {
     doc["updIntSec"] = cfgUpdateIntervalSec;
     doc["battOffV"] = cfgBattOffVoltage;
     doc["battHystV"] = cfgBattHysteresisV;
-    doc["battOffI"] = cfgBattOffCurrent;
     doc["chgCurA"] = cfgFullChargeCurrentA;
     doc["fullChgV"] = cfgFullChargeVoltage;
     doc["battDisW"] = cfgBattDischargeAllowW;
@@ -1608,7 +1588,6 @@ void setupWebServer() {
       float    newUpdInt     = cfgUpdateIntervalSec;
       float    newBattOffV   = cfgBattOffVoltage;
       float    newBattHystV  = cfgBattHysteresisV;
-      float    newBattOffI   = cfgBattOffCurrent;
       float    newChgCurA    = cfgFullChargeCurrentA;
       float    newFullChgV   = cfgFullChargeVoltage;
       float    newBattDisW   = cfgBattDischargeAllowW;
@@ -1618,7 +1597,6 @@ void setupWebServer() {
       if (req->hasParam("updIntSec",  true)) newUpdInt     = constrain(req->getParam("updIntSec",  true)->value().toFloat(), 0.5f,  10.0f);
       if (req->hasParam("battOffV",   true)) newBattOffV   = constrain(req->getParam("battOffV",   true)->value().toFloat(), 20.0f, 80.0f);
       if (req->hasParam("battHystV",  true)) newBattHystV  = constrain(req->getParam("battHystV",  true)->value().toFloat(), 0.0f,  10.0f);
-      if (req->hasParam("battOffI",   true)) newBattOffI   = constrain(req->getParam("battOffI",   true)->value().toFloat(), -100.0f, 100.0f);
       if (req->hasParam("chgCurA",    true)) newChgCurA    = constrain(req->getParam("chgCurA",    true)->value().toFloat(), -100.0f, 100.0f);
       if (req->hasParam("fullChgV",   true)) newFullChgV   = constrain(req->getParam("fullChgV",   true)->value().toFloat(), 20.0f, 80.0f);
       if (req->hasParam("battDisW",   true)) newBattDisW   = constrain(req->getParam("battDisW",   true)->value().toFloat(), 0.0f, 15000.0f);
@@ -1629,7 +1607,6 @@ void setupWebServer() {
         cfgUpdateIntervalSec    = newUpdInt;
         cfgBattOffVoltage       = newBattOffV;
         cfgBattHysteresisV      = newBattHystV;
-        cfgBattOffCurrent       = newBattOffI;
         cfgFullChargeCurrentA   = newChgCurA;
         cfgFullChargeVoltage    = newFullChgV;
         cfgBattDischargeAllowW  = newBattDisW;
@@ -1817,8 +1794,8 @@ void loop() {
 
         char l[192];
         snprintf(l, sizeof(l),
-                 ">>> RESET2 0x%04X status=0x%02X (%s)\n",
-                 invCfg.resetCounter2Addr, st, mbErrStr(st));
+         ">>> RESET2 0x%04X status=0x%02X (%s)\n",
+         invCfg.resetCounter2Addr, st, mbErrStr(st));
         serialLog(l);
         vTaskDelay(pdMS_TO_TICKS(150));
       }
