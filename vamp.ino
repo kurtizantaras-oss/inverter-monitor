@@ -11,7 +11,7 @@
 #define TX2_PIN 17
 #define RS485_CTRL 4
 #define LED_PIN 2
-#define SKETCH_VERSION "7.2.5"
+#define SKETCH_VERSION "7.2.6"
 #define SERIAL_BUF_SIZE 4096
 
 // ========================================================================
@@ -40,6 +40,9 @@ volatile bool webUpdateActive = false;
 volatile unsigned long lastWebUpdateActivityMs = 0;
 volatile bool pendingCounterReset = false;
 volatile bool dumpEnabled = false;
+
+// >>> FIX: флаг отложенного применения смены модели
+volatile int pendingModelChange = -1;
 
 static uint16_t invBuf[80], pvBuf[20];
 
@@ -615,18 +618,26 @@ void saveSettings() {
 
 // ========================================================================
 // ЗАСТОСУВАННЯ КОНФІГУРАЦІЇ ІНВЕРТОРА
+// >>> FIX: уменьшены блокирующие delay, добавлен лог в начале
 // ========================================================================
 void applyInverterConfig() {
   const InverterConfig& invCfg = inverterConfigs[cfgInverterModelIdx];
 
+  char logLine[160];
+  snprintf(logLine, sizeof(logLine),
+           ">>> applyInverterConfig: idx=%d id=%s slave=0x%02X baud=%lu\n",
+           cfgInverterModelIdx, invCfg.id, invCfg.slaveId,
+           (unsigned long)invCfg.baudRate);
+  serialLog(logLine);
+
   Serial1.end();
-  delay(100);
+  vTaskDelay(pdMS_TO_TICKS(50));      // >>> FIX: было delay(100)
   Serial1.begin(invCfg.baudRate, SERIAL_8N1, RX2_PIN, TX2_PIN);
-  delay(500);
+  vTaskDelay(pdMS_TO_TICKS(200));     // >>> FIX: было delay(500)
 
   if (invCfg.machineTypeAddr > 0 && invCfg.machinePowerAddr > 0) {
-    uint16_t r0 = readSingleRegisterWithRetry(invCfg.machineTypeAddr);
-    uint16_t r1 = readSingleRegisterWithRetry(invCfg.machinePowerAddr);
+    uint16_t r0 = readSingleRegisterWithRetry(invCfg.machineTypeAddr, 2);  // >>> FIX: retry 3->2
+    uint16_t r1 = readSingleRegisterWithRetry(invCfg.machinePowerAddr, 2);
     if (r0 != 0xFFFF && r1 != 0xFFFF) {
       xSemaphoreTake(dataMutex, portMAX_DELAY);
       inv.machineType = String((char)((r0 >> 8) & 0xFF)) + String((char)(r0 & 0xFF));
@@ -645,7 +656,6 @@ void applyInverterConfig() {
     xSemaphoreGive(dataMutex);
   }
 
-  char logLine[128];
   snprintf(logLine, sizeof(logLine),
            ">>> Inverter config switched to: %s (slaveId=0x%02X, baud=%lu)\n",
            invCfg.name, invCfg.slaveId, (unsigned long)invCfg.baudRate);
@@ -657,7 +667,6 @@ void applyInverterConfig() {
 // ========================================================================
 void triacTask(void *pvParameters) {
   TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t period = pdMS_TO_TICKS(TRIAC_TICK_MS);
   uint32_t windowStart = millis();
 
   for (;;) {
@@ -792,7 +801,6 @@ void pollModbusOnce() {
       freePower -= (int32_t)(battV * cfgFullChargeCurrentA);
     }
     freePower += (int32_t)cfgBattDischargeAllowW;
-
   }
 
   static bool isBattLow = false;
@@ -825,10 +833,8 @@ void pollModbusOnce() {
     targMessage = "Недостатньо потужності";
   }
   else if (battI < cfgFullChargeCurrentA && battV < cfgFullChargeVoltage) {
-    // Струм АКБ нижче мінімуму — не відключаємо, а зменшуємо потужність ТЕНа,
-    // щоб дати батареї більше заряду. Крок пропорційний дефіциту струму.
     int32_t deficitW = (int32_t)((cfgFullChargeCurrentA - battI) * battV);
-    if (deficitW < cfgMaxAllocatedVA / 20) deficitW = cfgMaxAllocatedVA / 20;   // мінімальний крок, щоб гарантовано зменшити
+    if (deficitW < cfgMaxAllocatedVA / 20) deficitW = cfgMaxAllocatedVA / 20;
     currentPower -= deficitW;
     if (currentPower < 0) currentPower = 0;
     freePower = 0;
@@ -883,10 +889,31 @@ void pollModbusOnce() {
 
 // ========================================================================
 // ЗАДАЧА MODBUS
+// >>> FIX: обработка pendingModelChange вынесена сюда
 // ========================================================================
 void modbusTask(void *pvParameters) {
   vTaskDelay(pdMS_TO_TICKS(2000));
   for (;;) {
+    // >>> FIX: применяем отложенную смену модели
+    if (pendingModelChange >= 0) {
+      if (xSemaphoreTake(modbusMutex, portMAX_DELAY) == pdTRUE) {
+        int newIdx = pendingModelChange;
+        pendingModelChange = -1;
+
+        cfgInverterModelIdx = newIdx;
+        applyInverterConfig();
+
+        // >>> FIX: сохраняем уже с правильным индексом
+        saveSettings();
+
+        char buf[64];
+        snprintf(buf, sizeof(buf), ">>> model applied & saved: %d\n", newIdx);
+        serialLog(buf);
+
+        xSemaphoreGive(modbusMutex);
+      }
+    }
+
     if (!webUpdateActive) {
       if (xSemaphoreTake(modbusMutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         pollModbusOnce();
@@ -1211,6 +1238,7 @@ input, select{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;backgro
 <div class="desc">Оберіть модель вашого інвертора. Від цього залежить, за якими адресами Modbus читатимуться напруги, струми, потужності та лічильники енергії. Якщо обрано неправильну модель — дані будуть некоректними або нульовими.</div>
 <div class="hint">Доступні моделі: SRNE / Must / EASUN — повна підтримка. Growatt, Voltronic / Axpert — заготовки (потребують заповнення адрес).</div>
 <select id="invModel"></select>
+<div class="hint" style="color:#4da3ff;font-style:normal">Після зміни моделі натисніть Save. Застосування триває до 3 секунд.</div>
 </div>
 
 <h2>General</h2><div class="card">
@@ -1283,7 +1311,13 @@ async function load(){
 async function save(){
 let body=["heaterVA","maxAllocVA","updIntSec","battOffV","battHystV","chgCurA","fullChgV","battDisW","invModel"].map(k=>k+"="+document.getElementById(k).value).join("&");
 try{let resp=await fetch("/save_settings",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});
-if(resp.status==200){document.getElementById("msg").style.display="block";document.getElementById("err").style.display="none";setTimeout(()=>document.getElementById("msg").style.display="none",2000);}
+if(resp.status==200){
+  document.getElementById("msg").style.display="block";
+  document.getElementById("err").style.display="none";
+  setTimeout(()=>document.getElementById("msg").style.display="none",2000);
+  // >>> FIX: перечитать настройки через 1.5 сек, чтобы увидеть применённую модель
+  setTimeout(load, 1500);
+}
 else if(resp.status==403){document.getElementById("err").style.display="block";document.getElementById("msg").style.display="none";setTimeout(()=>document.getElementById("err").style.display="none",3000);}
 else{alert("Save error!");}}catch(e){alert("Connection error!");}}
 load();
@@ -1498,7 +1532,10 @@ void setupWebServer() {
 
   server.on("/api_settings", HTTP_GET, [](AsyncWebServerRequest *r) {
     DynamicJsonDocument doc(1024);
-    doc["currentModel"] = cfgInverterModelIdx;
+    // >>> FIX: показываем уже применённый индекс (или отложенный, если он ждёт применения)
+    int shownModel = cfgInverterModelIdx;
+    if (pendingModelChange >= 0) shownModel = pendingModelChange;
+    doc["currentModel"] = shownModel;
     doc["heaterVA"] = (unsigned)cfgHeaterPowerVA;
     doc["maxAllocVA"] = (unsigned)cfgMaxAllocatedVA;
     doc["updIntSec"] = cfgUpdateIntervalSec;
@@ -1573,13 +1610,16 @@ void setupWebServer() {
     r->send(res);
   });
 
+  // >>> FIX: /save_settings больше не вызывает applyInverterConfig().
+  // Вместо этого выставляет pendingModelChange, а modbusTask применит в фоне.
   server.on("/save_settings", HTTP_POST, [](AsyncWebServerRequest *r) {
     requireLocalIP(r, [](AsyncWebServerRequest *req) {
       int newModelToApply = -1;
+      int reqModel = -1;
       if (req->hasParam("invModel", true)) {
-        int newModel = req->getParam("invModel", true)->value().toInt();
-        if (newModel >= 0 && newModel < NUM_INVERTER_MODELS && newModel != cfgInverterModelIdx) {
-          newModelToApply = newModel;
+        reqModel = req->getParam("invModel", true)->value().toInt();
+        if (reqModel >= 0 && reqModel < NUM_INVERTER_MODELS && reqModel != cfgInverterModelIdx) {
+          newModelToApply = reqModel;
         }
       }
 
@@ -1613,14 +1653,21 @@ void setupWebServer() {
         xSemaphoreGive(dataMutex);
       }
 
-      if (newModelToApply >= 0) {
-        if (xSemaphoreTake(modbusMutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-          cfgInverterModelIdx = newModelToApply;
-          applyInverterConfig();
-          xSemaphoreGive(modbusMutex);
-        }
-      }
+      // >>> FIX: сохраняем настройки СРАЗУ (не-модельные) и выставляем флаг на смену модели.
+      // Индекс модели будет записан ещё раз в modbusTask уже с правильным значением.
       saveSettings();
+
+      if (newModelToApply >= 0) {
+        pendingModelChange = newModelToApply;
+      }
+
+      // >>> FIX: диагностика
+      char buf[128];
+      snprintf(buf, sizeof(buf),
+               ">>> SAVE: reqModel=%d curModel=%d pending=%d\n",
+               reqModel, cfgInverterModelIdx, (int)pendingModelChange);
+      serialLog(buf);
+
       req->send(200, "text/plain", "OK");
     });
   });
@@ -1728,7 +1775,7 @@ void setup() {
   xTaskCreatePinnedToCore(triacTask,  "triacTask",  2048, nullptr, 2, &triacTaskHandle,  0);
   xTaskCreatePinnedToCore(modbusTask, "modbusTask", 4096, nullptr, 1, &modbusTaskHandle, 0);
 
-  serialLog("=== System started (Burst Control v7.2.5, raw Modbus) ===\n");
+  serialLog("=== System started (Burst Control v7.2.6, raw Modbus) ===\n");
 }
 
 void loop() {
