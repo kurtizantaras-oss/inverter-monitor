@@ -1,20 +1,23 @@
 /*
  * Inverter Monitor & Heater Controller — PI30 (QPIGS) for ECO II 4.2kW Plus
- * v8.6.9 — SSE + насос (power-gated) + post-run + история 7 суток
- *          + /history + счётчики энергии PV/Grid (кВт·ч, NVS, сброс)
- *          + Settings: блоки + подробные описания
- *          + UI: реальная мощность ТЭНа (actualTriacDuty, усреднённая за окно ШИМ)
- *          + energyGridWh только mode==2, nvsMutex, saveEnergy(), histStarted
- *          + сохранение истории в NVS (namespace "hist"), загрузка при старте
- *          + УБРАН pre-start: ТЭН греет сразу, как только насос запустился
- *          + FIX: target обнуляется при !pumpAllowed (ТЭН не греет в post-run)
- *          + FIX: NVS-история разбита на 2 ключа (b1/b2) — не теряется
- *          + FIX: currentPower обрезается до cfgMaxAllocatedVA
- *          + FIX: currentHeaterPercent сбрасывается при 3+ подряд неудачных опросах
- *          + FIX: saveEnergy раз в 10 мин + только при изменении (бережём NVS)
- *          + OPT: pi30_query → static char[] (без String в горячем пути)
- *          + OPT: pi30_parseQPIGS → const char* (без String)
- *          + OPT: защита от деления на 0 в triacTask (dutyTicks > 0)
+ * v8.6.12 — SSE + насос (power-gated) + post-run + история 7 суток
+ *           + /history + счётчики энергии PV/Grid (кВт·ч, NVS, сброс)
+ *           + Settings: блоки + подробные описания
+ *           + UI: реальная мощность ТЭНа (actualTriacDuty, усреднённая за окно ШИМ)
+ *           + energyGridWh только mode==2, nvsMutex, saveEnergy(), histStarted
+ *           + сохранение истории в NVS (namespace "hist"), загрузка при старте
+ *           + УБРАН pre-start: ТЭН греет сразу, как только насос запустился
+ *           + FIX: target обнуляется при !pumpAllowed (ТЭН не греет в post-run)
+ *           + FIX: NVS-история разбита на 2 ключа (b1/b2) — не теряется
+ *           + FIX: currentPower обрезается до cfgMaxAllocatedVA
+ *           + FIX: currentHeaterPercent сбрасывается при 3+ подряд неудачных опросах
+ *           + FIX: saveEnergy раз в 10 мин + только при изменении (бережём NVS)
+ *           + OPT: pi30_query → static char[] (без String в горячем пути)
+ *           + OPT: pi30_parseQPIGS → const char* (без String)
+ *           + OPT: защита от деления на 0 в triacTask (dutyTicks > 0)
+ *           + UI: 4 темы (Dark / Light / Ocean / Sunset), циклическое переключение
+ *           + DUMP: читаемый дамп TX/RX (ASCII + HEX + расшифровка QPIGS по индексам)
+ *           + FIX: автоскролл в /serial работает корректно + Clear чистит серверный буфер
  *
  * QPIGS-раскладка (0-based индексы):
  *   0 gridV 1 gridHz 2 acOutV 3 acOutHz 4 acOutVA 5 acOutW 6 loadPct 7 busV
@@ -36,7 +39,7 @@
 #define LED_PIN        2
 #define TRIAC_PIN      19
 #define PUMP_PIN       18
-#define SKETCH_VERSION "8.6.9-pi30-sse-pump-power-actual-smooth-hist-energy-nvs-theme"
+#define SKETCH_VERSION "8.6.12-pi30-sse-pump-power-actual-smooth-hist-energy-nvs-theme-4themes-dump"
 #define SERIAL_BUF_SIZE 4096
 
 constexpr uint32_t TRIAC_WINDOW_MS = 1000;
@@ -85,7 +88,7 @@ constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS     = 12000;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS  = 10000;
 constexpr uint32_t RESTART_DELAY_MS            = 2000;
 constexpr uint32_t WEB_UPDATE_TIMEOUT_MS       = 30000;
-constexpr uint32_t ENERGY_SAVE_INTERVAL_MS     = 600000UL;   // 10 мин
+constexpr uint32_t ENERGY_SAVE_INTERVAL_MS     = 600000UL;
 constexpr float    DEFAULT_UPDATE_INTERVAL_SEC = 2.0f;
 
 SemaphoreHandle_t dataMutex     = nullptr;
@@ -188,7 +191,6 @@ static void pi30_buildCmd(const char* text, uint8_t* buf, size_t& len) {
 
 static uint32_t pi30_callCount = 0;
 
-// OPT: без String в горячем пути. Выход — статический буфер.
 static bool pi30_query(const char* cmd, char* out, size_t outSize,
                        char startChar = '(', char endChar = '\r',
                        uint32_t timeoutMs = 2500) {
@@ -205,8 +207,8 @@ static bool pi30_query(const char* cmd, char* out, size_t outSize,
 
   bool doLog = (pi30_callCount < 3) || dumpEnabled;
   if (doLog) {
-    char buf[96];
-    int p = snprintf(buf, sizeof(buf), ">>> TX[%d]:", (int)frameLen);
+    char buf[160];
+    int p = snprintf(buf, sizeof(buf), ">>> TX \"%s\" | HEX:", cmd);
     for (size_t i = 0; i < frameLen && p < (int)sizeof(buf) - 4; i++)
       p += snprintf(buf + p, sizeof(buf) - p, " %02X", frame[i]);
     p += snprintf(buf + p, sizeof(buf) - p, "\n");
@@ -242,38 +244,73 @@ static bool pi30_query(const char* cmd, char* out, size_t outSize,
   out[respLen] = '\0';
 
   if (doLog) {
-    char buf[320];
-    int p = snprintf(buf, sizeof(buf), ">>> RX[%u]:", (unsigned)respLen);
-    for (size_t i = 0; i < respLen && p < (int)sizeof(buf) - 6; i++) {
-      uint8_t b = (uint8_t)out[i];
-      p += snprintf(buf + p, sizeof(buf) - p, " %02X", b);
-    }
-    if (respLen > 0 && p < (int)sizeof(buf) - 4) {
-      p += snprintf(buf + p, sizeof(buf) - p, "  [");
-      for (size_t i = 0; i < respLen && p < (int)sizeof(buf) - 4; i++) {
-        char c = out[i];
-        buf[p++] = (c >= 32 && c < 127) ? c : '.';
-      }
-      p += snprintf(buf + p, sizeof(buf) - p, "]\n");
+    if (respLen == 0) {
+      serialLog("<<< RX <EMPTY — no response!>\n");
     } else {
-      p += snprintf(buf + p, sizeof(buf) - p, "  <EMPTY — no response!>\n");
+      char ascii[200];
+      size_t ai = 0;
+      for (size_t i = 0; i < respLen && ai < sizeof(ascii) - 1; i++) {
+        char c = out[i];
+        if (c == '\r') { ascii[ai++] = '\\'; ascii[ai++] = 'r'; continue; }
+        if (c == '\n') { ascii[ai++] = '\\'; ascii[ai++] = 'n'; continue; }
+        if (c == 0x00) { ascii[ai++] = '.'; continue; }
+        ascii[ai++] = (c >= 32 && c < 127) ? c : '.';
+      }
+      ascii[ai] = '\0';
+
+      char buf[400];
+      int p = snprintf(buf, sizeof(buf), "<<< RX[%u] \"%s\"\n", (unsigned)respLen, ascii);
+      serialLog(buf);
+
+      if (strncmp(out, "(QPIGS", 6) != 0 && out[0] == '(' && respLen > 30) {
+        const char* body = out + 1;
+        size_t bodyLen = respLen - 2;
+        if (respLen >= 2 && out[respLen - 1] == '\r') bodyLen = respLen - 2;
+        else bodyLen = respLen - 1;
+
+        const char* names[21] = {
+          "gridV", "gridHz", "acOutV", "acOutHz", "acOutVA", "acOutW", "loadPct", "busV",
+          "battV", "battChgA", "battCap", "tempC", "pvA", "pvV", "sccBattV",
+          "battDischA", "deviceStatus", "fanOffset", "eepromVer", "pvPowerW", "status2"
+        };
+        const char* units[21] = {
+          "V", "Hz", "V", "Hz", "VA", "W", "%", "V",
+          "V", "A", "%", "°C", "A", "V", "V",
+          "A", "", "", "", "W", ""
+        };
+
+        int idx = 0;
+        size_t pos = 0;
+        while (pos < bodyLen && idx < 21) {
+          while (pos < bodyLen && body[pos] == ' ') pos++;
+          if (pos >= bodyLen) break;
+          size_t end = pos;
+          while (end < bodyLen && body[end] != ' ') end++;
+          char field[32];
+          size_t flen = end - pos;
+          if (flen > sizeof(field) - 1) flen = sizeof(field) - 1;
+          memcpy(field, body + pos, flen);
+          field[flen] = '\0';
+          p = snprintf(buf, sizeof(buf), "    [%02d] %-13s = %s %s\n",
+                       idx, names[idx], field, units[idx]);
+          serialLog(buf);
+          idx++;
+          pos = end + 1;
+        }
+      }
     }
-    serialLog(buf);
     pi30_callCount++;
   }
 
   return (respLen > 0);
 }
 
-// OPT: без String. Работает с сырым буфером.
 static bool pi30_parseQPIGS(const char* resp, size_t respLen, InverterData& out) {
   if (!resp || respLen < 2) return false;
   if (resp[0] != '(' || resp[respLen - 1] != '\r') return false;
 
-  // Тело: от resp[1] до resp[respLen-2] (исключая '\r')
   size_t bodyStart = 1;
-  size_t bodyEnd   = respLen - 1;   // позиция '\r'
-  // trim по краям
+  size_t bodyEnd   = respLen - 1;
   while (bodyStart < bodyEnd && (resp[bodyStart] == ' ' || resp[bodyStart] == '\r' || resp[bodyStart] == '\n')) bodyStart++;
   while (bodyEnd > bodyStart && (resp[bodyEnd - 1] == ' ' || resp[bodyEnd - 1] == '\r' || resp[bodyEnd - 1] == '\n')) bodyEnd--;
 
@@ -286,7 +323,6 @@ static bool pi30_parseQPIGS(const char* resp, size_t respLen, InverterData& out)
     size_t end = start;
     while (end < bodyEnd && resp[end] != ' ') end++;
 
-    // atof на подстроке без копирования: временный буфер
     char field[32];
     size_t flen = end - start;
     if (flen > sizeof(field) - 1) flen = sizeof(field) - 1;
@@ -521,7 +557,6 @@ void triacTask(void *pvParameters) {
       }
     }
 
-    // FIX: ТЭН греет ТОЛЬКО пока есть разрешение (мощность + switch).
     if (!pumpAllowed) target = 0;
 
     if (target == 0) {
@@ -556,7 +591,6 @@ void triacTask(void *pvParameters) {
       dutySum   += (currentTriacDuty > 0) ? 100UL : 0UL;
       dutyTicks += 1;
       if (dutyTicks >= ticksPerWindow) {
-        // OPT: защита от деления на 0 (формально dutyTicks >= 100, но для читаемости)
         if (dutyTicks > 0) actualTriacDuty = (uint8_t)(dutySum / dutyTicks);
         dutySum   = 0;
         dutyTicks = 0;
@@ -663,7 +697,12 @@ void pollInverterOnce() {
   digitalWrite(LED_PIN, LOW);
   vTaskDelay(pdMS_TO_TICKS(20));
 
-  // OPT: статический буфер вместо String
+  if (dumpEnabled) {
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), "--- poll #%lu ---\n", (unsigned long)(dataVersion + 1));
+    serialLog(hdr);
+  }
+
   char respBuf[256];
   digitalWrite(LED_PIN, HIGH); vTaskDelay(pdMS_TO_TICKS(30)); digitalWrite(LED_PIN, LOW);
   bool gotResp = pi30_query("QPIGS", respBuf, sizeof(respBuf));
@@ -920,6 +959,24 @@ html[data-theme="light"]{
   --shadow:0 8px 24px rgba(30,50,80,.08);
   --shadow-sm:0 2px 8px rgba(30,50,80,.06);
 }
+html[data-theme="ocean"]{
+  --bg:#071820; --bg2:#0c2431; --panel:#102a38; --panel2:#153544;
+  --border:#1e4a5e; --border-hi:#2a6480;
+  --text:#e0f4fa; --text-dim:#7eb3c9; --text-muted:#4f8098;
+  --accent:#00d4d4; --accent-dim:#00a8a8;
+  --yellow:#ffd166; --blue:#4ecdc4; --red:#ff6b6b; --purple:#a29bfe;
+  --shadow:0 8px 24px rgba(0,0,0,.5);
+  --shadow-sm:0 2px 8px rgba(0,0,0,.35);
+}
+html[data-theme="sunset"]{
+  --bg:#1a0f14; --bg2:#26151c; --panel:#2e1a23; --panel2:#3a2029;
+  --border:#4d2a36; --border-hi:#663847;
+  --text:#fdeef0; --text-dim:#c99aa8; --text-muted:#8a5f6e;
+  --accent:#ff7b54; --accent-dim:#e85d35;
+  --yellow:#ffd166; --blue:#ff9e7a; --red:#ff5c5c; --purple:#c084fc;
+  --shadow:0 8px 24px rgba(0,0,0,.55);
+  --shadow-sm:0 2px 8px rgba(0,0,0,.4);
+}
 *{box-sizing:border-box}
 body{
   background:var(--bg);
@@ -1025,7 +1082,7 @@ body{
 .grid-indicator.grid-charge .dot{background:var(--red);box-shadow:0 0 8px var(--red);animation:pulse 1.6s infinite}
 .grid-indicator.grid-charge .lbl{color:var(--red)}
 
-.controls{margin-top:18px;display:flex;flex-wrap:wrap;gap:10px;justify-content:center;width:100%;max-width:1100px}
+.controls{margin-top:18px;display:flex;flex-wrap:wrap;gap:10px;justify-content:center;width:100%;max-width:1100px;align-items:center}
 .btn{
   color:#fff;border:1px solid transparent;padding:9px 16px;border-radius:var(--radius-sm);
   cursor:pointer;font-size:12px;font-family:inherit;font-weight:700;
@@ -1042,6 +1099,12 @@ body{
 .btn.gray{background:var(--panel2);color:var(--text);border-color:var(--border)}
 .btn.gray:hover{background:var(--border);color:var(--text)}
 .btn.red{background:var(--red);color:#fff}
+
+.theme-toggle{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);border-radius:999px;padding:6px 12px;cursor:pointer;color:var(--text-dim);font-size:12px;font-weight:600;font-family:inherit;transition:all var(--transition);box-shadow:0 2px 8px rgba(0,0,0,.15);min-width:90px;justify-content:center}
+.theme-toggle:hover{border-color:var(--border-hi);color:var(--text)}
+.theme-toggle svg{width:16px;height:16px;fill:currentColor;transition:transform .4s}
+.theme-toggle:hover svg{transform:rotate(20deg)}
+
 .update-section{background:var(--panel);padding:18px;border-radius:var(--radius);margin-top:14px;width:100%;max-width:520px;box-sizing:border-box;display:none;box-shadow:var(--shadow);border:1px solid var(--border)}
 .update-section.active{display:block;animation:slideDown .3s ease}
 @keyframes slideDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
@@ -1214,7 +1277,7 @@ body{
     <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
     Firmware
   </button>
-  <button class="btn gray" onclick="toggleTheme()" id="themeBtn" title="Змінити тему">
+  <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn" title="Змінити тему (Dark → Light → Ocean → Sunset)">
     <svg id="themeIcon" viewBox="0 0 24 24"><path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
     <span id="themeLabel">Dark</span>
   </button>
@@ -1229,22 +1292,29 @@ body{
 </div>
 
 <script>
+const THEMES = ['dark', 'light', 'ocean', 'sunset'];
+const THEME_LABELS = { dark: 'Dark', light: 'Light', ocean: 'Ocean', sunset: 'Sunset' };
+
 function setTheme(t){
+  if (!THEMES.includes(t)) t = 'dark';
   document.documentElement.setAttribute('data-theme', t);
   localStorage.setItem('inv_theme', t);
   const lbl = document.getElementById('themeLabel');
   const icon = document.getElementById('themeIcon');
-  if (lbl) lbl.textContent = (t === 'light') ? 'Light' : 'Dark';
+  if (lbl) lbl.textContent = THEME_LABELS[t] || 'Dark';
   if (icon) icon.style.transform = (t === 'light') ? 'rotate(180deg)' : 'rotate(0)';
 }
 function toggleTheme(){
-  const cur = document.documentElement.getAttribute('data-theme');
-  setTheme(cur === 'light' ? 'dark' : 'light');
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  const idx = THEMES.indexOf(cur);
+  const next = THEMES[(idx + 1) % THEMES.length];
+  setTheme(next);
 }
 (function initTheme(){
   const saved = localStorage.getItem('inv_theme');
+  if (saved && THEMES.includes(saved)) { setTheme(saved); return; }
   const sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  setTheme(saved || sys);
+  setTheme(sys);
 })();
 
 function wsStr(v){
@@ -1426,7 +1496,7 @@ const char HISTORY_HTML[] PROGMEM = R"rawliteral(
   --border:#2a3340; --border-hi:#3a4553;
   --text:#e6edf3; --text-dim:#8a97a8; --text-muted:#5b6677;
   --accent:#00e0a1; --accent-dim:#00b080;
-  --yellow:#ffc857; --blue:#4ea8ff; --red:#ff5c5c;
+  --yellow:#ffc857; --blue:#4ea8ff; --red:#ff5c5c; --purple:#b48cff;
   --shadow:0 8px 24px rgba(0,0,0,.35);
   --radius:14px; --radius-sm:10px;
   --transition:.25s cubic-bezier(.4,0,.2,1);
@@ -1436,8 +1506,24 @@ html[data-theme="light"]{
   --border:#d6dde6; --border-hi:#c0cad6;
   --text:#1a2230; --text-dim:#5a6878; --text-muted:#8a97a8;
   --accent:#00a878; --accent-dim:#008a62;
-  --yellow:#e8a317; --blue:#2b7fd4; --red:#e63946;
+  --yellow:#e8a317; --blue:#2b7fd4; --red:#e63946; --purple:#8b5cf6;
   --shadow:0 8px 24px rgba(30,50,80,.08);
+}
+html[data-theme="ocean"]{
+  --bg:#071820; --bg2:#0c2431; --panel:#102a38; --panel2:#153544;
+  --border:#1e4a5e; --border-hi:#2a6480;
+  --text:#e0f4fa; --text-dim:#7eb3c9; --text-muted:#4f8098;
+  --accent:#00d4d4; --accent-dim:#00a8a8;
+  --yellow:#ffd166; --blue:#4ecdc4; --red:#ff6b6b; --purple:#a29bfe;
+  --shadow:0 8px 24px rgba(0,0,0,.5);
+}
+html[data-theme="sunset"]{
+  --bg:#1a0f14; --bg2:#26151c; --panel:#2e1a23; --panel2:#3a2029;
+  --border:#4d2a36; --border-hi:#663847;
+  --text:#fdeef0; --text-dim:#c99aa8; --text-muted:#8a5f6e;
+  --accent:#ff7b54; --accent-dim:#e85d35;
+  --yellow:#ffd166; --blue:#ff9e7a; --red:#ff5c5c; --purple:#c084fc;
+  --shadow:0 8px 24px rgba(0,0,0,.55);
 }
 *{box-sizing:border-box}
 body{
@@ -1453,7 +1539,7 @@ body{
 .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;letter-spacing:.3px}
 .brand svg{width:22px;height:22px;fill:var(--accent)}
 .brand span{color:var(--text-dim);font-weight:400;font-size:12px;margin-left:2px}
-.theme-toggle{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);border-radius:999px;padding:6px 12px;cursor:pointer;color:var(--text-dim);font-size:12px;font-weight:600;transition:all var(--transition);box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.theme-toggle{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);border-radius:999px;padding:6px 12px;cursor:pointer;color:var(--text-dim);font-size:12px;font-weight:600;font-family:inherit;transition:all var(--transition);box-shadow:0 2px 8px rgba(0,0,0,.15);min-width:90px;justify-content:center}
 .theme-toggle:hover{border-color:var(--border-hi);color:var(--text)}
 .theme-toggle svg{width:16px;height:16px;fill:currentColor;transition:transform .4s}
 .theme-toggle:hover svg{transform:rotate(20deg)}
@@ -1493,7 +1579,7 @@ body{
     <svg viewBox="0 0 24 24"><path d="M3 13h2v7H3v-7zm4-6h2v13H7V7zm4-4h2v17h-2V3zm4 8h2v9h-2v-9zm4-4h2v13h-2V7z"/></svg>
     Power History <span>PV · INV · BATT</span>
   </div>
-  <div class="theme-toggle" onclick="toggleTheme()" title="Змінити тему">
+  <div class="theme-toggle" onclick="toggleTheme()" id="themeBtn" title="Змінити тему (Dark → Light → Ocean → Sunset)">
     <svg id="themeIcon" viewBox="0 0 24 24"><path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
     <span id="themeLabel">Dark</span>
   </div>
@@ -1546,23 +1632,30 @@ body{
 </div>
 
 <script>
+const THEMES = ['dark', 'light', 'ocean', 'sunset'];
+const THEME_LABELS = { dark: 'Dark', light: 'Light', ocean: 'Ocean', sunset: 'Sunset' };
+
 function setTheme(t){
+  if (!THEMES.includes(t)) t = 'dark';
   document.documentElement.setAttribute('data-theme', t);
   localStorage.setItem('inv_theme', t);
   const lbl = document.getElementById('themeLabel');
   const icon = document.getElementById('themeIcon');
-  if (lbl)  lbl.textContent = (t === 'light') ? 'Light' : 'Dark';
+  if (lbl)  lbl.textContent = THEME_LABELS[t] || 'Dark';
   if (icon) icon.style.transform = (t === 'light') ? 'rotate(180deg)' : 'rotate(0)';
   setTimeout(drawHistory, 60);
 }
 function toggleTheme(){
-  const cur = document.documentElement.getAttribute('data-theme');
-  setTheme(cur === 'light' ? 'dark' : 'light');
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  const idx = THEMES.indexOf(cur);
+  const next = THEMES[(idx + 1) % THEMES.length];
+  setTheme(next);
 }
 (function initTheme(){
   const saved = localStorage.getItem('inv_theme');
+  if (saved && THEMES.includes(saved)) { setTheme(saved); return; }
   const sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  setTheme(saved || sys);
+  setTheme(sys);
 })();
 
 const HIST_BUCKET_MS = 30 * 60 * 1000;
@@ -1820,52 +1913,136 @@ const char SERIAL_HTML[] PROGMEM = R"rawliteral(
   --text:#e6e6e6; --text-dim:#888;
   --accent:#00ff88; --accent-dim:#00cc6a;
   --btn-bg:#555; --btn-text:#fff;
+  --shadow:0 8px 24px rgba(0,0,0,.35);
 }
 html[data-theme="light"]{
-  --bg:#eef2f7; --panel:#ffffff; --border:#d6dde6;
+  --bg:#eef2f7; --panel:#ffffff; --border:#d6dde6; --border-hi:#c0cad6;
   --text:#1a2230; --text-dim:#5a6878;
   --accent:#00a878; --accent-dim:#008a62;
   --btn-bg:#c0cad6; --btn-text:#1a2230;
 }
-body{background:var(--bg);color:var(--text);font-family:monospace;padding:15px;margin:0}
+html[data-theme="ocean"]{
+  --bg:#071820; --panel:#102a38; --border:#1e4a5e; --border-hi:#2a6480;
+  --text:#e0f4fa; --text-dim:#7eb3c9;
+  --accent:#00d4d4; --accent-dim:#00a8a8;
+  --btn-bg:#153544; --btn-text:#e0f4fa;
+}
+html[data-theme="sunset"]{
+  --bg:#1a0f14; --panel:#2e1a23; --border:#4d2a36; --border-hi:#663847;
+  --text:#fdeef0; --text-dim:#c99aa8;
+  --accent:#ff7b54; --accent-dim:#e85d35;
+  --btn-bg:#3a2029; --btn-text:#fdeef0;
+}
+body{background:var(--bg);color:var(--text);font-family:monospace;padding:15px;margin:0;transition:background-color .25s,color .25s}
 h1{color:var(--accent);text-align:center;font-size:18px}
 #log{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px;height:70vh;overflow-y:auto;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all}
 .btn{background:var(--accent);color:#000;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold;margin:3px}
 .bg{background:var(--btn-bg);color:var(--btn-text)}
 .ctr{text-align:center;margin:10px 0}
+.theme-toggle{display:inline-flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);border-radius:999px;padding:6px 12px;cursor:pointer;color:var(--text-dim);font-size:12px;font-weight:600;font-family:inherit;transition:all .25s;box-shadow:0 2px 8px rgba(0,0,0,.15);margin:3px;min-width:90px;justify-content:center}
+.theme-toggle:hover{border-color:var(--border-hi);color:var(--text)}
+.theme-toggle svg{width:16px;height:16px;fill:currentColor;transition:transform .4s}
+.theme-toggle:hover svg{transform:rotate(20deg)}
 </style></head><body>
 <h1>Serial Monitor</h1>
 <div class="ctr">
 <button class="btn" onclick="fetchLog()">Refresh</button>
-<button class="btn bg" onclick="document.getElementById('log').innerText=''">Clear</button>
+<button class="btn bg" onclick="clearLog()">Clear</button>
 <button class="btn bg" id="autoBtn" onclick="toggleAuto()">Auto-scroll: ON</button>
 <button class="btn bg" id="dumpBtn" onclick="toggleDump()">Dump: OFF</button>
-<button class="btn bg" onclick="toggleTheme()" id="themeBtn">🌓 Тема</button>
+<button class="theme-toggle" onclick="toggleTheme()" id="themeBtn" title="Змінити тему (Dark → Light → Ocean → Sunset)">
+  <svg id="themeIcon" viewBox="0 0 24 24"><path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+  <span id="themeLabel">Dark</span>
+</button>
 <button class="btn bg" onclick="location.href='/'">Back</button>
 </div>
 <div id="log">Loading...</div>
 <script>
+const THEMES = ['dark', 'light', 'ocean', 'sunset'];
+const THEME_LABELS = { dark: 'Dark', light: 'Light', ocean: 'Ocean', sunset: 'Sunset' };
+
 function setTheme(t){
+  if (!THEMES.includes(t)) t = 'dark';
   document.documentElement.setAttribute('data-theme', t);
   localStorage.setItem('inv_theme', t);
+  const lbl = document.getElementById('themeLabel');
+  const icon = document.getElementById('themeIcon');
+  if (lbl) lbl.textContent = THEME_LABELS[t] || 'Dark';
+  if (icon) icon.style.transform = (t === 'light') ? 'rotate(180deg)' : 'rotate(0)';
 }
 function toggleTheme(){
-  const cur = document.documentElement.getAttribute('data-theme');
-  setTheme(cur === 'light' ? 'dark' : 'light');
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  const idx = THEMES.indexOf(cur);
+  const next = THEMES[(idx + 1) % THEMES.length];
+  setTheme(next);
 }
 (function initTheme(){
   const saved = localStorage.getItem('inv_theme');
+  if (saved && THEMES.includes(saved)) { setTheme(saved); return; }
   const sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  setTheme(saved || sys);
+  setTheme(sys);
 })();
 
-let autoScroll=true, dumpOn=false;
-function toggleAuto(){autoScroll=!autoScroll;document.getElementById("autoBtn").innerText=autoScroll?"Auto-scroll: ON":"Auto-scroll: OFF";}
-function updDump(){let b=document.getElementById("dumpBtn");b.innerText=dumpOn?"Dump: ON":"Dump: OFF";b.style.background=dumpOn?"var(--accent)":"var(--btn-bg)";b.style.color=dumpOn?"#000":"var(--btn-text)";}
-async function loadDump(){try{let d=await(await fetch("/api_dump")).json();dumpOn=(d.dump===1);}catch(e){}updDump();}
-async function toggleDump(){dumpOn=!dumpOn;try{let d=await(await fetch("/api_dump?state="+(dumpOn?"1":"0"))).json();dumpOn=(d.dump===1);}catch(e){}updDump();}
-async function fetchLog(){try{let t=await(await fetch("/api_serial")).text();let el=document.getElementById("log");el.innerText=t;if(autoScroll)el.scrollTop=el.scrollHeight;}catch(e){document.getElementById("log").innerText="Error: "+e;}}
-loadDump();fetchLog();setInterval(fetchLog,2000);
+let autoScroll = true, dumpOn = false;
+
+function toggleAuto(){
+  autoScroll = !autoScroll;
+  document.getElementById("autoBtn").innerText = autoScroll ? "Auto-scroll: ON" : "Auto-scroll: OFF";
+  if (autoScroll) {
+    const el = document.getElementById("log");
+    requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+  }
+}
+
+function updDump(){
+  let b = document.getElementById("dumpBtn");
+  b.innerText = dumpOn ? "Dump: ON" : "Dump: OFF";
+  b.style.background = dumpOn ? "var(--accent)" : "var(--btn-bg)";
+  b.style.color = dumpOn ? "#000" : "var(--btn-text)";
+}
+async function loadDump(){
+  try { let d = await (await fetch("/api_dump")).json(); dumpOn = (d.dump === 1); } catch(e){}
+  updDump();
+}
+async function toggleDump(){
+  dumpOn = !dumpOn;
+  try { let d = await (await fetch("/api_dump?state=" + (dumpOn ? "1" : "0"))).json(); dumpOn = (d.dump === 1); } catch(e){}
+  updDump();
+}
+
+async function clearLog(){
+  try { await fetch("/api_serial_clear", { method: "POST" }); } catch(e){}
+  document.getElementById("log").innerText = "";
+}
+
+async function fetchLog(){
+  try {
+    const t = await (await fetch("/api_serial")).text();
+    const el = document.getElementById("log");
+    if (t === el.innerText) return;
+    el.innerText = t;
+    if (autoScroll) {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          el.scrollTop = el.scrollHeight;
+        });
+      });
+    }
+  } catch(e) {
+    document.getElementById("log").innerText = "Error: " + e;
+  }
+}
+
+document.getElementById("log").addEventListener("scroll", () => {
+  const el = document.getElementById("log");
+  const atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 30;
+  autoScroll = atBottom;
+  document.getElementById("autoBtn").innerText = autoScroll ? "Auto-scroll: ON" : "Auto-scroll: OFF";
+});
+
+loadDump();
+fetchLog();
+setInterval(fetchLog, 2000);
 </script></body></html>
 )rawliteral";
 
@@ -1890,13 +2067,29 @@ html[data-theme="light"]{
   --blue:#2b7fd4; --yellow:#e8a317; --red:#e63946; --purple:#8b5cf6;
   --btn-bg:#c0cad6; --btn-text:#1a2230;
 }
+html[data-theme="ocean"]{
+  --bg:#071820; --panel:#102a38; --panel2:#153544; --border:#1e4a5e; --border-hi:#2a6480;
+  --text:#e0f4fa; --text-dim:#7eb3c9;
+  --accent:#00d4d4; --accent-dim:#00a8a8;
+  --input-bg:#0c2431; --input-border:#2a6480;
+  --blue:#4ecdc4; --yellow:#ffd166; --red:#ff6b6b; --purple:#a29bfe;
+  --btn-bg:#153544; --btn-text:#e0f4fa;
+}
+html[data-theme="sunset"]{
+  --bg:#1a0f14; --panel:#2e1a23; --panel2:#3a2029; --border:#4d2a36; --border-hi:#663847;
+  --text:#fdeef0; --text-dim:#c99aa8;
+  --accent:#ff7b54; --accent-dim:#e85d35;
+  --input-bg:#26151c; --input-border:#663847;
+  --blue:#ff9e7a; --yellow:#ffd166; --red:#ff5c5c; --purple:#c084fc;
+  --btn-bg:#3a2029; --btn-text:#fdeef0;
+}
 *{box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;padding:16px;margin:0;min-height:100vh}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;padding:16px;margin:0;min-height:100vh;transition:background-color .25s,color .25s}
 .wrap{max-width:760px;margin:0 auto}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:18px;flex-wrap:wrap}
 .topbar h1{margin:0;color:var(--accent);font-size:20px;display:flex;align-items:center;gap:10px}
 .topbar h1 svg{width:22px;height:22px;fill:var(--accent)}
-.topbar .actions{display:flex;gap:8px;flex-wrap:wrap}
+.topbar .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 
 .section{background:var(--panel);border:1px solid var(--border);border-radius:14px;margin-bottom:16px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,.15)}
 .section-head{display:flex;align-items:center;gap:10px;padding:14px 18px;background:var(--panel2);border-bottom:1px solid var(--border);cursor:pointer;user-select:none;transition:background .2s}
@@ -1922,13 +2115,17 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
 .field .desc code{background:var(--bg);padding:1px 5px;border-radius:3px;font-family:'JetBrains Mono',Consolas,monospace;font-size:11px;color:var(--accent)}
 .field input{width:100%;padding:11px 12px;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border);border-radius:8px;font-size:14px;font-family:'JetBrains Mono',Consolas,monospace;transition:border-color .2s,box-shadow .2s}
 .field input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent)}
-.field input.invalid{border-color:var(--red);box-shadow:0 0 0 3px color-mix(in srgb, var(--red) 20%, transparent)}
 
 .btn{background:var(--accent);color:#000;border:none;padding:10px 18px;border-radius:8px;cursor:pointer;font-weight:700;font-family:inherit;font-size:13px;transition:all .2s;display:inline-flex;align-items:center;gap:6px}
 .btn:hover{transform:translateY(-1px);filter:brightness(1.08)}
 .btn:active{transform:translateY(0)}
 .btn.bg{background:var(--btn-bg);color:var(--btn-text)}
 .btn svg{width:14px;height:14px;fill:currentColor}
+
+.theme-toggle{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);border-radius:999px;padding:6px 12px;cursor:pointer;color:var(--text-dim);font-size:12px;font-weight:600;font-family:inherit;transition:all .25s;box-shadow:0 2px 8px rgba(0,0,0,.15);min-width:90px;justify-content:center}
+.theme-toggle:hover{border-color:var(--border-hi);color:var(--text)}
+.theme-toggle svg{width:16px;height:16px;fill:currentColor;transition:transform .4s}
+.theme-toggle:hover svg{transform:rotate(20deg)}
 
 .msg{color:var(--accent);text-align:center;margin:12px 0;padding:10px;background:color-mix(in srgb, var(--accent) 10%, transparent);border:1px solid var(--accent);border-radius:8px;display:none;font-weight:600}
 .err{color:var(--red);text-align:center;margin:12px 0;padding:10px;background:color-mix(in srgb, var(--red) 10%, transparent);border:1px solid var(--red);border-radius:8px;display:none;font-weight:600}
@@ -1945,7 +2142,10 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
   </h1>
   <div class="actions">
     <button class="btn bg" onclick="toggleAll()" id="toggleAllBtn" title="Розгорнути/згорнути всі блоки">Згорнути все</button>
-    <button class="btn bg" onclick="toggleTheme()" id="themeBtn">🌓 Тема</button>
+    <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn" title="Змінити тему (Dark → Light → Ocean → Sunset)">
+      <svg id="themeIcon" viewBox="0 0 24 24"><path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+      <span id="themeLabel">Dark</span>
+    </button>
   </div>
 </div>
 
@@ -2084,20 +2284,29 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
 
 </div>
 <script>
+const THEMES = ['dark', 'light', 'ocean', 'sunset'];
+const THEME_LABELS = { dark: 'Dark', light: 'Light', ocean: 'Ocean', sunset: 'Sunset' };
+
 function setTheme(t){
+  if (!THEMES.includes(t)) t = 'dark';
   document.documentElement.setAttribute('data-theme', t);
   localStorage.setItem('inv_theme', t);
-  const btn = document.getElementById('themeBtn');
-  if (btn) btn.textContent = (t === 'light') ? '☀️ Світла' : '🌙 Темна';
+  const lbl = document.getElementById('themeLabel');
+  const icon = document.getElementById('themeIcon');
+  if (lbl) lbl.textContent = THEME_LABELS[t] || 'Dark';
+  if (icon) icon.style.transform = (t === 'light') ? 'rotate(180deg)' : 'rotate(0)';
 }
 function toggleTheme(){
-  const cur = document.documentElement.getAttribute('data-theme');
-  setTheme(cur === 'light' ? 'dark' : 'light');
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  const idx = THEMES.indexOf(cur);
+  const next = THEMES[(idx + 1) % THEMES.length];
+  setTheme(next);
 }
 (function initTheme(){
   const saved = localStorage.getItem('inv_theme');
+  if (saved && THEMES.includes(saved)) { setTheme(saved); return; }
   const sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  setTheme(saved || sys);
+  setTheme(sys);
 })();
 
 function toggleSection(head){
@@ -2182,14 +2391,27 @@ const char SIGNAL_HTML[] PROGMEM = R"rawliteral(
   --text:#e6e6e6; --text-dim:#888;
   --accent:#00ff88; --bar-bg:#333;
   --btn-bg:#555; --btn-text:#fff;
+  --shadow:0 8px 24px rgba(0,0,0,.35);
 }
 html[data-theme="light"]{
-  --bg:#eef2f7; --panel:#ffffff; --border:#d6dde6;
+  --bg:#eef2f7; --panel:#ffffff; --border:#d6dde6; --border-hi:#c0cad6;
   --text:#1a2230; --text-dim:#5a6878;
   --accent:#00a878; --bar-bg:#e0e6ee;
   --btn-bg:#c0cad6; --btn-text:#1a2230;
 }
-body{background:var(--bg);color:var(--text);font-family:monospace;padding:15px;margin:0}
+html[data-theme="ocean"]{
+  --bg:#071820; --panel:#102a38; --border:#1e4a5e; --border-hi:#2a6480;
+  --text:#e0f4fa; --text-dim:#7eb3c9;
+  --accent:#00d4d4; --bar-bg:#153544;
+  --btn-bg:#153544; --btn-text:#e0f4fa;
+}
+html[data-theme="sunset"]{
+  --bg:#1a0f14; --panel:#2e1a23; --border:#4d2a36; --border-hi:#663847;
+  --text:#fdeef0; --text-dim:#c99aa8;
+  --accent:#ff7b54; --bar-bg:#3a2029;
+  --btn-bg:#3a2029; --btn-text:#fdeef0;
+}
+body{background:var(--bg);color:var(--text);font-family:monospace;padding:15px;margin:0;transition:background-color .25s,color .25s}
 h1{color:var(--accent);text-align:center;font-size:18px}
 .card{background:var(--panel);border-radius:10px;padding:20px;max-width:420px;margin:12px auto;border:1px solid var(--border)}
 .big{text-align:center;font-size:36px;font-weight:bold;margin:8px 0}
@@ -2202,6 +2424,10 @@ h1{color:var(--accent);text-align:center;font-size:18px}
 .btn{background:var(--accent);color:#000;border:none;padding:10px 18px;border-radius:6px;cursor:pointer;font-weight:bold;margin:5px}
 .bg{background:var(--btn-bg);color:var(--btn-text)}
 .center{text-align:center;margin-top:14px}
+.theme-toggle{display:inline-flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);border-radius:999px;padding:6px 12px;cursor:pointer;color:var(--text-dim);font-size:12px;font-weight:600;font-family:inherit;transition:all .25s;box-shadow:0 2px 8px rgba(0,0,0,.15);margin:5px;min-width:90px;justify-content:center}
+.theme-toggle:hover{border-color:var(--border-hi);color:var(--text)}
+.theme-toggle svg{width:16px;height:16px;fill:currentColor;transition:transform .4s}
+.theme-toggle:hover svg{transform:rotate(20deg)}
 </style></head><body>
 <h1>Рівень сигналу</h1>
 <div class="card">
@@ -2213,22 +2439,36 @@ h1{color:var(--accent);text-align:center;font-size:18px}
 <div class="row"><span class="k">MAC</span><span class="v" id="mac">--</span></div>
 </div>
 <div class="center">
-<button class="btn bg" onclick="toggleTheme()" id="themeBtn">🌓 Тема</button>
+<button class="theme-toggle" onclick="toggleTheme()" id="themeBtn" title="Змінити тему (Dark → Light → Ocean → Sunset)">
+  <svg id="themeIcon" viewBox="0 0 24 24"><path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+  <span id="themeLabel">Dark</span>
+</button>
 <button class="btn bg" onclick="location.href='/'">Назад</button>
 </div>
 <script>
+const THEMES = ['dark', 'light', 'ocean', 'sunset'];
+const THEME_LABELS = { dark: 'Dark', light: 'Light', ocean: 'Ocean', sunset: 'Sunset' };
+
 function setTheme(t){
+  if (!THEMES.includes(t)) t = 'dark';
   document.documentElement.setAttribute('data-theme', t);
   localStorage.setItem('inv_theme', t);
+  const lbl = document.getElementById('themeLabel');
+  const icon = document.getElementById('themeIcon');
+  if (lbl) lbl.textContent = THEME_LABELS[t] || 'Dark';
+  if (icon) icon.style.transform = (t === 'light') ? 'rotate(180deg)' : 'rotate(0)';
 }
 function toggleTheme(){
-  const cur = document.documentElement.getAttribute('data-theme');
-  setTheme(cur === 'light' ? 'dark' : 'light');
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  const idx = THEMES.indexOf(cur);
+  const next = THEMES[(idx + 1) % THEMES.length];
+  setTheme(next);
 }
 (function initTheme(){
   const saved = localStorage.getItem('inv_theme');
+  if (saved && THEMES.includes(saved)) { setTheme(saved); return; }
   const sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  setTheme(saved || sys);
+  setTheme(sys);
 })();
 
 function esc(s){return String(s||'--').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
@@ -2260,17 +2500,31 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
   --bg:#0f0f0f; --panel:#1c1c1c; --border:#555;
   --text:#fff; --text-dim:#888;
   --accent:#00ff88; --input-bg:#333;
+  --shadow:0 8px 24px rgba(0,0,0,.35);
 }
 html[data-theme="light"]{
-  --bg:#eef2f7; --panel:#ffffff; --border:#c0cad6;
+  --bg:#eef2f7; --panel:#ffffff; --border:#c0cad6; --border-hi:#b0bcc9;
   --text:#1a2230; --text-dim:#5a6878;
   --accent:#00a878; --input-bg:#f0f3f8;
 }
-body{background:var(--bg);color:var(--text);font-family:monospace;padding:20px;text-align:center;margin:0}
+html[data-theme="ocean"]{
+  --bg:#071820; --panel:#102a38; --border:#1e4a5e; --border-hi:#2a6480;
+  --text:#e0f4fa; --text-dim:#7eb3c9;
+  --accent:#00d4d4; --input-bg:#0c2431;
+}
+html[data-theme="sunset"]{
+  --bg:#1a0f14; --panel:#2e1a23; --border:#4d2a36; --border-hi:#663847;
+  --text:#fdeef0; --text-dim:#c99aa8;
+  --accent:#ff7b54; --input-bg:#26151c;
+}
+body{background:var(--bg);color:var(--text);font-family:monospace;padding:20px;text-align:center;margin:0;transition:background-color .25s,color .25s}
 .card{background:var(--panel);border-radius:12px;padding:20px;max-width:360px;margin:0 auto;border:1px solid var(--border)}
 select,input,button{width:100%;box-sizing:border-box;padding:12px;margin:8px 0;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:14px}
 button{background:var(--accent);color:#000;font-weight:bold;cursor:pointer;border:none}
-.theme-link{background:transparent;color:var(--text-dim);font-size:12px;padding:6px;border:none;cursor:pointer;text-decoration:underline;width:auto;margin:0 auto;display:inline-block}
+.theme-toggle{display:inline-flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);border-radius:999px;padding:8px 14px;cursor:pointer;color:var(--text-dim);font-size:12px;font-weight:600;font-family:inherit;transition:all .25s;box-shadow:0 2px 8px rgba(0,0,0,.15);margin:10px auto 0;width:auto;min-width:90px;justify-content:center}
+.theme-toggle:hover{border-color:var(--border-hi);color:var(--text)}
+.theme-toggle svg{width:16px;height:16px;fill:currentColor;transition:transform .4s}
+.theme-toggle:hover svg{transform:rotate(20deg)}
 </style></head><body>
 <div class="card">
 <h2>WiFi Setup</h2>
@@ -2279,21 +2533,35 @@ button{background:var(--accent);color:#000;font-weight:bold;cursor:pointer;borde
 <input type="password" name="password" placeholder="Password">
 <button type="submit">Save</button>
 </form>
-<button class="theme-link" onclick="toggleTheme()" id="themeBtn">🌓 Змінити тему</button>
+<button class="theme-toggle" onclick="toggleTheme()" id="themeBtn" title="Змінити тему (Dark → Light → Ocean → Sunset)">
+  <svg id="themeIcon" viewBox="0 0 24 24"><path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+  <span id="themeLabel">Dark</span>
+</button>
 </div>
 <script>
+const THEMES = ['dark', 'light', 'ocean', 'sunset'];
+const THEME_LABELS = { dark: 'Dark', light: 'Light', ocean: 'Ocean', sunset: 'Sunset' };
+
 function setTheme(t){
+  if (!THEMES.includes(t)) t = 'dark';
   document.documentElement.setAttribute('data-theme', t);
   localStorage.setItem('inv_theme', t);
+  const lbl = document.getElementById('themeLabel');
+  const icon = document.getElementById('themeIcon');
+  if (lbl) lbl.textContent = THEME_LABELS[t] || 'Dark';
+  if (icon) icon.style.transform = (t === 'light') ? 'rotate(180deg)' : 'rotate(0)';
 }
 function toggleTheme(){
-  const cur = document.documentElement.getAttribute('data-theme');
-  setTheme(cur === 'light' ? 'dark' : 'light');
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  const idx = THEMES.indexOf(cur);
+  const next = THEMES[(idx + 1) % THEMES.length];
+  setTheme(next);
 }
 (function initTheme(){
   const saved = localStorage.getItem('inv_theme');
+  if (saved && THEMES.includes(saved)) { setTheme(saved); return; }
   const sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  setTheme(saved || sys);
+  setTheme(sys);
 })();
 
 fetch("/scan_wifi").then(r=>r.json()).then(n=>{let s=document.getElementById("ss");s.innerHTML="";
@@ -2532,6 +2800,13 @@ void setupWebServer() {
     r->send(res);
   });
 
+  server.on("/api_serial_clear", HTTP_POST, [](AsyncWebServerRequest *r) {
+    portENTER_CRITICAL(&serialMux);
+    serialTail = serialHead;
+    portEXIT_CRITICAL(&serialMux);
+    r->send(200, "text/plain", "OK");
+  });
+
   server.on("/api_serial", HTTP_GET, [](AsyncWebServerRequest *r) {
     auto* res = r->beginResponseStream("text/plain; charset=utf-8");
     uint16_t t;
@@ -2726,7 +3001,7 @@ void setup() {
   xTaskCreatePinnedToCore(triacTask,    "triacTask",    2048, nullptr, 2, &triacTaskHandle,    0);
   xTaskCreatePinnedToCore(inverterTask, "inverterTask", 4096, nullptr, 1, &inverterTaskHandle, 0);
 
-  serialLog("=== System started (PI30 QPIGS ECO II, v8.6.9 SSE + PUMP(power-gated, no-pre-start) + ACTUAL TRIAC(smooth) + HISTORY(NVS split) + ENERGY + THEME + RAW-BUF) ===\n");
+  serialLog("=== System started (PI30 QPIGS ECO II, v8.6.12 SSE + PUMP(power-gated, no-pre-start) + ACTUAL TRIAC(smooth) + HISTORY(NVS split) + ENERGY + THEME(4) + RAW-BUF + DUMP) ===\n");
 }
 
 void loop() {
